@@ -87,25 +87,37 @@ class ACOSolver(Solver):
 
     def __init__(self, env: DeliveryEnv):
         super().__init__(env)
-        self.bfs = BFS(env.grid)
-        self.rng = random.Random(int(getattr(env, "seed", 0)))
+        self.bfs: Optional[BFS] = None
+        self.rng = random.Random(0)
         self.pheromone: Dict[Tuple[Position, Position], float] = defaultdict(lambda: 1.0)
         self.pickup_heat: Dict[Position, float] = defaultdict(float)
         self.targets: Dict[int, Tuple[str, int, Position]] = {}
         self.run_deadline = 0.0
-        if env.N >= 20:
+        self.grid: List[List[int]] = [[0]]
+        self.N = 1
+        self.C = 1
+        self.T = 1
+        self._configure_by_observation(1, 1, 1, [[0]])
+
+    def _configure_by_observation(self, n: int, c: int, t: int, grid: List[List[int]]) -> None:
+        self.N = n
+        self.C = c
+        self.T = t
+        self.grid = grid
+        self.bfs = BFS(grid)
+        if n >= 20:
             self.d1_penalty = 0.65
             self.d2_penalty = 0.18
             self.late_penalty = 1.20
-        elif env.N >= 17:
+        elif n >= 17:
             self.d1_penalty = 0.55
             self.d2_penalty = 0.22
             self.late_penalty = 1.35
-        elif env.N >= 13:
+        elif n >= 13:
             self.d1_penalty = 0.30
             self.d2_penalty = 0.10
             self.late_penalty = 0.80
-        elif env.N >= 11:
+        elif n >= 11:
             self.d1_penalty = 0.40
             self.d2_penalty = 0.15
             self.late_penalty = 1.00
@@ -153,7 +165,7 @@ class ACOSolver(Solver):
         if d1 >= INF or d2 >= INF:
             return 0.0
         finish = now + d1 + d2
-        reward = delivery_reward(order, finish, self.env.T)
+        reward = delivery_reward(order, finish, self.T)
         late = max(0, finish - order.et)
         heat = self.pickup_heat.get(pickup, 0.0)
         cluster = sum(1 for o in orders.values() if not o.picked and abs(o.sx - order.sx) + abs(o.sy - order.sy) <= 3)
@@ -189,7 +201,7 @@ class ACOSolver(Solver):
             return None
         return max(
             carried,
-            key=lambda o: delivery_reward(o, now + self.bfs.dist(shipper.position, (o.ex, o.ey)), self.env.T)
+            key=lambda o: delivery_reward(o, now + self.bfs.dist(shipper.position, (o.ex, o.ey)), self.T)
             - 0.2 * self.bfs.dist(shipper.position, (o.ex, o.ey)),
         )
 
@@ -205,7 +217,7 @@ class ACOSolver(Solver):
                 delivery = self._delivery_target(shipper, orders, now)
                 if delivery is not None:
                     targets[shipper.id] = ("deliver", delivery.id, (delivery.ex, delivery.ey))
-                    total += delivery_reward(delivery, now + self.bfs.dist(shipper.position, (delivery.ex, delivery.ey)), self.env.T)
+                    total += delivery_reward(delivery, now + self.bfs.dist(shipper.position, (delivery.ex, delivery.ey)), self.T)
                 continue
             candidates = []
             weights = []
@@ -237,7 +249,7 @@ class ACOSolver(Solver):
         best_targets: Dict[int, Tuple[str, int, Position]] = {}
         best_edges: List[Tuple[Position, Position]] = []
         ants = max(8, min(18, 3 * max(1, len(shippers))))
-        iterations = 3 if self.env.N <= 10 else 2
+        iterations = 3 if self.N <= 10 else 2
         for _ in range(iterations):
             for _ in range(ants):
                 if self.run_deadline and time.time() > self.run_deadline:
@@ -276,7 +288,7 @@ class ACOSolver(Solver):
         return resolve_collisions_and_blocks(
             list(obs["shippers"]),
             actions,
-            self.env.grid,
+            self.grid,
             obs["orders"],
             self._pickup_at,
             self._deliverable,
@@ -309,8 +321,9 @@ class ACOSolver(Solver):
 
     def run(self) -> dict:
         start = time.time()
-        self.run_deadline = start + max(20.0, min(110.0, 0.12 * self.env.T + 9.0 * self.env.C))
         obs = self.env.reset()
+        self._configure_by_observation(int(obs["N"]), int(obs["C"]), int(obs["T"]), obs["grid"])
+        self.run_deadline = start + max(20.0, min(110.0, 0.12 * self.T + 9.0 * self.C))
         while not obs.get("done", False):
             if time.time() > self.run_deadline:
                 actions = {s.id: ("S", 2) for s in obs["shippers"]}

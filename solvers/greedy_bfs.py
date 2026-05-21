@@ -89,35 +89,48 @@ class GreedyBFS(Solver):
 
     def __init__(self, env: DeliveryEnv):
         super().__init__(env)
-        self.bfs = BFS(env.grid)
+        self.bfs: Optional[BFS] = None
         self.run_deadline = 0.0
+        self.grid: List[List[int]] = [[0]]
+        self.N = 1
+        self.C = 1
+        self.T = 1
+        self.has_inner_obstacles = False
+        self._configure_by_observation(1, 1, 1, [[0]])
+
+    def _configure_by_observation(self, n: int, c: int, t: int, grid: List[List[int]]) -> None:
+        self.N = n
+        self.C = c
+        self.T = t
+        self.grid = grid
+        self.bfs = BFS(grid)
         self.has_inner_obstacles = any(
-            env.grid[r][c] != 0
-            for r in range(1, max(1, env.N - 1))
-            for c in range(1, max(1, env.N - 1))
+            grid[r][col] != 0
+            for r in range(1, max(1, n - 1))
+            for col in range(1, max(1, n - 1))
         )
-        if env.N >= 20:
+        if n >= 20:
             self.pickup_priority_bonus = 3.5
             self.pickup_d1_penalty = 0.35
             self.pickup_d2_penalty = 0.12
             self.pickup_late_penalty = 0.70
             self.pickup_density_base = 0.70
             self.carry_pick_threshold = 999.0
-        elif env.N >= 17:
+        elif n >= 17:
             self.pickup_priority_bonus = 3.0
             self.pickup_d1_penalty = 0.45
             self.pickup_d2_penalty = 0.16
             self.pickup_late_penalty = 0.60
             self.pickup_density_base = 0.60
             self.carry_pick_threshold = 22.0
-        elif env.N >= 13:
+        elif n >= 13:
             self.pickup_priority_bonus = 3.5
             self.pickup_d1_penalty = 0.35
             self.pickup_d2_penalty = 0.12
             self.pickup_late_penalty = 0.70
             self.pickup_density_base = 0.70
             self.carry_pick_threshold = 16.0
-        elif env.N >= 11:
+        elif n >= 11:
             self.pickup_priority_bonus = 3.5
             self.pickup_d1_penalty = 0.35
             self.pickup_d2_penalty = 0.12
@@ -182,7 +195,7 @@ class GreedyBFS(Solver):
         if d1 >= INF or d2 >= INF:
             return -INF
         finish = now + d1 + d2
-        reward = delivery_reward(order, finish, self.env.T)
+        reward = delivery_reward(order, finish, self.T)
         late = max(0, finish - order.et)
         density = 0.0
         for other in orders.values():
@@ -205,7 +218,7 @@ class GreedyBFS(Solver):
             d = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
             rough.append((4.0 * order.p - 0.25 * d - 0.02 * max(0, order.et - now), order))
         rough.sort(key=lambda item: (-item[0], item[1].et, item[1].id))
-        limit = max(12, min(36, 10 + 5 * self.env.C + len(orders) // 8))
+        limit = max(12, min(36, 10 + 5 * self.C + len(orders) // 8))
         candidates = []
         for _, order in rough[:limit]:
             score = self._pickup_score(shipper, order, orders, now)
@@ -213,7 +226,7 @@ class GreedyBFS(Solver):
                 candidates.append((score, order))
         if not candidates:
             return None
-        if self.env.C < 5 and self.has_inner_obstacles:
+        if self.C < 5 and self.has_inner_obstacles:
             return min(
                 (item[1] for item in candidates),
                 key=lambda o: (
@@ -253,13 +266,13 @@ class GreedyBFS(Solver):
         return resolve_collisions_and_blocks(
             list(obs["shippers"]),
             actions,
-            self.env.grid,
+            self.grid,
             obs["orders"],
             self._pickup_at,
             self._deliverable,
             target_positions,
             self.bfs.dist,
-            allow_unblock=self.has_inner_obstacles or self.env.C >= 3,
+            allow_unblock=self.has_inner_obstacles or self.C >= 3,
         )
 
     def _decide(self, obs: dict) -> Dict[int, Action]:
@@ -293,8 +306,9 @@ class GreedyBFS(Solver):
 
     def run(self) -> dict:
         start = time.time()
-        self.run_deadline = start + max(20.0, min(80.0, 0.08 * self.env.T + 6.0 * self.env.C))
         obs = self.env.reset()
+        self._configure_by_observation(int(obs["N"]), int(obs["C"]), int(obs["T"]), obs["grid"])
+        self.run_deadline = start + max(20.0, min(80.0, 0.08 * self.T + 6.0 * self.C))
         while not obs.get("done", False):
             if time.time() > self.run_deadline:
                 actions = {s.id: ("S", 2) for s in obs["shippers"]}

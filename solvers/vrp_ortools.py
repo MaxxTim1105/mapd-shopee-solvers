@@ -87,28 +87,40 @@ class VRPOrToolsSolver(Solver):
 
     def __init__(self, env: DeliveryEnv):
         super().__init__(env)
-        self.bfs = BFS(env.grid)
+        self.bfs: Optional[BFS] = None
         self.route_plan: Dict[int, List[Stop]] = {}
         self.run_deadline = 0.0
-        if env.C <= 2:
+        self.grid: List[List[int]] = [[0]]
+        self.N = 1
+        self.C = 1
+        self.T = 1
+        self._configure_by_observation(1, 1, 1, [[0]])
+        self.ortools_calls = 0
+        self.ortools_successes = 0
+        self.ortools_failures = 0
+        self.ortools_available: Optional[bool] = None
+
+    def _configure_by_observation(self, n: int, c: int, t: int, grid: List[List[int]]) -> None:
+        self.N = n
+        self.C = c
+        self.T = t
+        self.grid = grid
+        self.bfs = BFS(grid)
+        if c <= 2:
             self.travel_penalty = 0.012
             self.late_penalty = 0.20
-        elif env.N >= 20:
+        elif n >= 20:
             self.travel_penalty = 0.135
             self.late_penalty = 0.48
-        elif env.N >= 17:
+        elif n >= 17:
             self.travel_penalty = 0.075
             self.late_penalty = 0.38
-        elif env.N >= 13:
+        elif n >= 13:
             self.travel_penalty = 0.06
             self.late_penalty = 0.35
         else:
             self.travel_penalty = 0.04
             self.late_penalty = 0.30
-        self.ortools_calls = 0
-        self.ortools_successes = 0
-        self.ortools_failures = 0
-        self.ortools_available: Optional[bool] = None
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -134,7 +146,7 @@ class VRPOrToolsSolver(Solver):
             return None
         return min(here, key=lambda o: (-o.p, o.et, o.id))
 
-    def _hotspot_density(self, order: Order, orders: Dict[int, Order]) -> float:
+    def _visible_pickup_density(self, order: Order, orders: Dict[int, Order]) -> float:
         density = 0.0
         for other in orders.values():
             if other.picked or other.delivered:
@@ -154,14 +166,14 @@ class VRPOrToolsSolver(Solver):
         if d1 >= INF or d2 >= INF:
             return -INF
         finish = now + d1 + d2
-        reward = delivery_reward(order, finish, self.env.T)
+        reward = delivery_reward(order, finish, self.T)
         late = max(0, finish - order.et)
         slack = order.et - finish
         urgency = max(0.0, min(18.0, 18.0 - slack)) * (0.12 + 0.08 * order.p)
-        return reward + 3.5 * order.p + self._hotspot_density(order, orders) + urgency - 0.28 * d1 - 0.10 * d2 - 0.85 * late
+        return reward + 3.5 * order.p + self._visible_pickup_density(order, orders) + urgency - 0.28 * d1 - 0.10 * d2 - 0.85 * late
 
     def _candidate_pool(self, shipper: Shipper, orders: Dict[int, Order], now: int, limit: int = 34) -> List[Order]:
-        if self.env.N < 20:
+        if self.N < 20:
             scored = []
             for order in orders.values():
                 if not self._can_take(shipper, order, orders):
@@ -175,7 +187,7 @@ class VRPOrToolsSolver(Solver):
                     for other in orders.values()
                     if not other.picked and abs(other.sx - order.sx) + abs(other.sy - order.sy) <= 4
                 )
-                rough_score = delivery_reward(order, finish, self.env.T) + 1.8 * density + 4.0 * order.p - 0.35 * d1 - late
+                rough_score = delivery_reward(order, finish, self.T) + 1.8 * density + 4.0 * order.p - 0.35 * d1 - late
                 scored.append((rough_score, order.et, order.id, order))
             scored.sort(key=lambda item: (-item[0], item[1], item[2]))
             return [item[3] for item in scored[:limit]]
@@ -188,7 +200,7 @@ class VRPOrToolsSolver(Solver):
             d2 = abs(order.sx - order.ex) + abs(order.sy - order.ey)
             finish = now + d1 + d2
             late = max(0, finish - order.et)
-            rough_score = delivery_reward(order, finish, self.env.T) + 4.0 * order.p + self._hotspot_density(order, orders) - 0.28 * d1 - 0.08 * d2 - late
+            rough_score = delivery_reward(order, finish, self.T) + 4.0 * order.p + self._visible_pickup_density(order, orders) - 0.28 * d1 - 0.08 * d2 - late
             rough.append((rough_score, order.et, order.id, order))
         rough.sort(key=lambda item: (-item[0], item[1], item[2]))
         scored = []
@@ -218,20 +230,20 @@ class VRPOrToolsSolver(Solver):
                 continue
             if kind == "pickup":
                 if oid not in carried:
-                    if self.env.N >= 20 and (len(carried) >= shipper.K_max or load + order.w > shipper.W_max):
+                    if self.N >= 20 and (len(carried) >= shipper.K_max or load + order.w > shipper.W_max):
                         return -INF
                     load += order.w
                     carried.add(oid)
                     picked.add(oid)
             elif kind == "deliver" and oid in carried:
-                reward = delivery_reward(order, t, self.env.T)
+                reward = delivery_reward(order, t, self.T)
                 late = max(0, t - order.et)
                 value += reward - self.late_penalty * late
                 if oid in picked:
                     value += 1.0
-                    if self.env.N >= 20:
-                        value += 0.15 * self._hotspot_density(order, orders)
-                if self.env.N >= 20:
+                    if self.N >= 20:
+                        value += 0.15 * self._visible_pickup_density(order, orders)
+                if self.N >= 20:
                     same_dest = sum(
                         1
                         for other_id in carried
@@ -405,7 +417,7 @@ class VRPOrToolsSolver(Solver):
         return resolve_collisions_and_blocks(
             list(obs["shippers"]),
             actions,
-            self.env.grid,
+            self.grid,
             obs["orders"],
             self._pickup_at,
             self._deliverable,
@@ -438,8 +450,9 @@ class VRPOrToolsSolver(Solver):
 
     def run(self) -> dict:
         start = time.time()
-        self.run_deadline = start + max(20.0, min(90.0, 0.10 * self.env.T + 8.0 * self.env.C))
         obs = self.env.reset()
+        self._configure_by_observation(int(obs["N"]), int(obs["C"]), int(obs["T"]), obs["grid"])
+        self.run_deadline = start + max(20.0, min(90.0, 0.10 * self.T + 8.0 * self.C))
         while not obs.get("done", False):
             if time.time() > self.run_deadline:
                 actions = {s.id: ("S", 2) for s in obs["shippers"]}

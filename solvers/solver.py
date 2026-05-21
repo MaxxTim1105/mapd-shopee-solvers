@@ -21,12 +21,17 @@ class Solver:
         raise NotImplementedError
 
 
-def default_result(method: str, cfg: dict, orders: Optional[list[Order]] = None) -> dict:
+def default_result(
+    method: str,
+    config_name: str,
+    total_orders: int,
+    orders: Optional[list[Order]] = None,
+) -> dict:
     """Kết quả mặc định cho các solver skeleton chưa cài đặt."""
-    total_orders = int(cfg.get("G", len(orders) if orders is not None else 0))
+    total_orders = int(total_orders if total_orders is not None else (len(orders) if orders is not None else 0))
     return {
         "method": method,
-        "config_name": cfg.get("name", "unknown"),
+        "config_name": config_name,
         "total_orders": total_orders,
         "orders_generated": 0,
         "delivered": 0,

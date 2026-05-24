@@ -7,7 +7,15 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
 from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.detour_utils import (
+    evaluate_detour_net_reward,
+    find_best_detour_target,
+    is_pickup_safe,
+)
 from solvers.solver import Solver
+
+
+from solvers.heuristic_utils import get_aco_params, estimate_average_shortest_path
 
 
 Move = str
@@ -15,6 +23,7 @@ Position = Tuple[int, int]
 Action = Tuple[Move, int]
 INF = 10**8
 MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
+
 
 
 class BFS:
@@ -105,26 +114,9 @@ class ACOSolver(Solver):
         self.T = t
         self.grid = grid
         self.bfs = BFS(grid)
-        if n >= 20:
-            self.d1_penalty = 0.65
-            self.d2_penalty = 0.18
-            self.late_penalty = 1.20
-        elif n >= 17:
-            self.d1_penalty = 0.55
-            self.d2_penalty = 0.22
-            self.late_penalty = 1.35
-        elif n >= 13:
-            self.d1_penalty = 0.30
-            self.d2_penalty = 0.10
-            self.late_penalty = 0.80
-        elif n >= 11:
-            self.d1_penalty = 0.40
-            self.d2_penalty = 0.15
-            self.late_penalty = 1.00
-        else:
-            self.d1_penalty = 0.20
-            self.d2_penalty = 0.05
-            self.late_penalty = 0.50
+        self.shipper_commitments: Dict[int, int] = {}
+        self.asd = estimate_average_shortest_path(grid, self.bfs)
+        self.d1_penalty, self.d2_penalty, self.late_penalty = get_aco_params(n, c, t, grid, self.bfs)
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -214,10 +206,49 @@ class ACOSolver(Solver):
         self.rng.shuffle(shuffled)
         for shipper in shuffled:
             if shipper.bag:
-                delivery = self._delivery_target(shipper, orders, now)
-                if delivery is not None:
-                    targets[shipper.id] = ("deliver", delivery.id, (delivery.ex, delivery.ey))
-                    total += delivery_reward(delivery, now + self.bfs.dist(shipper.position, (delivery.ex, delivery.ey)), self.T)
+                # 1. Kiểm tra cam kết đi vòng hiện tại trước
+                committed_order = None
+                if shipper.id in self.shipper_commitments:
+                    committed_oid = self.shipper_commitments[shipper.id]
+                    if committed_oid in orders:
+                        committed_order = orders[committed_oid]
+                
+                if committed_order is not None:
+                    pickup_pos = (committed_order.sx, committed_order.sy)
+                    if is_pickup_safe(shipper, committed_order, orders, now, pickup_pos, self.bfs.dist):
+                        targets[shipper.id] = ("pickup", committed_order.id, pickup_pos)
+                        used.add(committed_order.id)
+                        pickup = pickup_pos
+                        drop = (committed_order.ex, committed_order.ey)
+                        edges.append((pickup, drop))
+                        total += self._heuristic(shipper, committed_order, orders, now)
+                        continue
+                
+                # 2. Nếu không có cam kết hoặc cam kết không an toàn, tìm đường vòng mới hoặc đi giao hàng
+                detour_allowed = self.asd < 7.2 or self.T >= 700
+                can_pickup_more = (
+                    detour_allowed
+                    and len(shipper.bag) < shipper.K_max
+                    and self._carried_weight(shipper, orders) < shipper.W_max
+                )
+                detour = None
+                if can_pickup_more:
+                    detour = find_best_detour_target(
+                        shipper, orders, now, used, shuffled, self.bfs.dist, self.T, self._can_take
+                    )
+                
+                if detour is not None:
+                    targets[shipper.id] = ("pickup", detour.id, (detour.sx, detour.sy))
+                    used.add(detour.id)
+                    pickup = (detour.sx, detour.sy)
+                    drop = (detour.ex, detour.ey)
+                    edges.append((pickup, drop))
+                    total += self._heuristic(shipper, detour, orders, now)
+                else:
+                    delivery = self._delivery_target(shipper, orders, now)
+                    if delivery is not None:
+                        targets[shipper.id] = ("deliver", delivery.id, (delivery.ex, delivery.ey))
+                        total += delivery_reward(delivery, now + self.bfs.dist(shipper.position, (delivery.ex, delivery.ey)), self.T)
                 continue
             candidates = []
             weights = []
@@ -249,7 +280,7 @@ class ACOSolver(Solver):
         best_targets: Dict[int, Tuple[str, int, Position]] = {}
         best_edges: List[Tuple[Position, Position]] = []
         ants = max(8, min(18, 3 * max(1, len(shippers))))
-        iterations = 3 if self.N <= 10 else 2
+        iterations = 3 if self.asd <= 6.0 else 2
         for _ in range(iterations):
             for _ in range(ants):
                 if self.run_deadline and time.time() > self.run_deadline:
@@ -301,15 +332,45 @@ class ACOSolver(Solver):
         orders: Dict[int, Order] = obs["orders"]
         shippers: List[Shipper] = list(obs["shippers"])
         now = int(obs["t"])
+        
+        # Clean up invalid/completed commitments
+        for sid in list(self.shipper_commitments.keys()):
+            oid = self.shipper_commitments[sid]
+            if oid not in orders or orders[oid].picked or orders[oid].delivered:
+                del self.shipper_commitments[sid]
+                
         targets = self._aco_targets(shippers, orders, now)
+        
+        # Save commitments for carrying shippers
+        for shipper in shippers:
+            if shipper.bag:
+                target = targets.get(shipper.id)
+                if target is not None and target[0] == "pickup":
+                    self.shipper_commitments[shipper.id] = target[1]
+                else:
+                    self.shipper_commitments.pop(shipper.id, None)
+                    
         actions: Dict[int, Action] = {}
         for shipper in shippers:
             if self._deliverable(shipper, orders, shipper.position):
                 actions[shipper.id] = ("S", 2)
+                self.shipper_commitments.pop(shipper.id, None)
                 continue
             here = self._pickup_at(shipper, orders, shipper.position)
-            if here is not None and not shipper.bag:
+            detour_allowed = self.asd < 7.2 or self.T >= 700
+            if not detour_allowed:
+                pickup_allowed = here is not None and not shipper.bag
+            else:
+                pickup_allowed = here is not None and (
+                    not shipper.bag
+                    or (
+                        is_pickup_safe(shipper, here, orders, now, shipper.position, self.bfs.dist)
+                        and evaluate_detour_net_reward(shipper, here, orders, now, self.bfs.dist, self.T) > 0.0
+                    )
+                )
+            if pickup_allowed:
                 actions[shipper.id] = ("S", 1)
+                self.shipper_commitments.pop(shipper.id, None)
                 continue
             target = targets.get(shipper.id)
             if target is None:

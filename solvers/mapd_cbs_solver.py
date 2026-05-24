@@ -6,7 +6,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
 from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.detour_utils import (
+    evaluate_detour_net_reward,
+    is_pickup_safe,
+)
 from solvers.solver import Solver
+from solvers.heuristic_utils import get_cbs_params, estimate_average_shortest_path
+
 
 
 Move = str
@@ -90,9 +96,16 @@ class MAPDCBSSolver(Solver):
         self.T = t
         self.grid = grid
         self.bfs = BFS(grid)
-        self.horizon = max(8, min(18, 5 + c + n // 8))
-        self.route_travel_penalty = 0.05 + min(0.08, 0.02 * max(0, c - 2))
-        self.route_late_penalty = 0.42 + min(0.35, 0.015 * n)
+        self.asd = estimate_average_shortest_path(grid, self.bfs)
+        params = get_cbs_params(n, c, t, grid, self.bfs)
+        self.horizon = params["horizon"]
+        self.route_travel_penalty = params["route_travel_penalty"]
+        self.route_late_penalty = params["route_late_penalty"]
+        
+        # Scale-invariant heuristic coefficients
+        self.pickup_d1_coeff = 2.0 / self.asd
+        self.pickup_d2_coeff = 0.7 / self.asd
+        self.pickup_late_coeff = 6.0 / self.asd
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -155,7 +168,7 @@ class MAPDCBSSolver(Solver):
         urgency = max(0.0, min(24.0, 24.0 - slack)) * (0.08 + 0.05 * order.p)
         density = self._visible_pickup_density(order, orders)
         drop_density = self._visible_drop_density(drop, orders)
-        return reward + 3.0 * order.p + 1.1 * density + 0.6 * drop_density + urgency - 0.28 * d1 - 0.10 * d2 - 0.8 * late
+        return reward + 3.0 * order.p + 1.1 * density + 0.6 * drop_density + urgency - self.pickup_d1_coeff * d1 - self.pickup_d2_coeff * d2 - self.pickup_late_coeff * late
 
     def _candidate_pool(self, shipper: Shipper, orders: Dict[int, Order], now: int) -> List[Order]:
         rough = []
@@ -166,7 +179,7 @@ class MAPDCBSSolver(Solver):
             d2 = abs(order.sx - order.ex) + abs(order.sy - order.ey)
             finish = now + d1 + d2
             late = max(0, finish - order.et)
-            score = delivery_reward(order, finish, self.T) + 4.0 * order.p + self._visible_pickup_density(order, orders) - 0.25 * d1 - 0.08 * d2 - late
+            score = delivery_reward(order, finish, self.T) + 4.0 * order.p + self._visible_pickup_density(order, orders) - self.pickup_d1_coeff * d1 - self.pickup_d2_coeff * d2 - self.pickup_late_coeff * late
             rough.append((score, order.et, order.id, order))
         rough.sort(key=lambda item: (-item[0], item[1], item[2]))
         limit = max(16, min(44, 10 + 4 * self.C + len(orders) // 8))
@@ -269,6 +282,9 @@ class MAPDCBSSolver(Solver):
                 for order in self._candidate_pool(shipper, orders, now):
                     if order.id in assigned:
                         continue
+                    if shipper.bag and self.asd >= 5.0:
+                        if not is_pickup_safe(shipper, order, orders, now, (order.sx, order.sy), self.bfs.dist):
+                            continue
                     gain, route = self._best_insertion(shipper, routes[shipper.id], order, orders, now)
                     if route is None or gain <= 0:
                         continue
@@ -393,7 +409,18 @@ class MAPDCBSSolver(Solver):
             if self._deliverable(shipper, orders, shipper.position):
                 actions[shipper.id] = ("S", 2)
             else:
-                active.append(shipper)
+                here = self._pickup_at(shipper, orders, shipper.position)
+                if self.asd < 5.0:
+                    pickup_allowed = here is not None and not shipper.bag
+                else:
+                    pickup_allowed = here is not None and (
+                        not shipper.bag
+                        or is_pickup_safe(shipper, here, orders, now, shipper.position, self.bfs.dist)
+                    )
+                if pickup_allowed:
+                    actions[shipper.id] = ("S", 1)
+                else:
+                    active.append(shipper)
 
         routes = self._build_routes(active, orders, now)
         targets: Dict[int, Tuple[str, int, Position]] = {}

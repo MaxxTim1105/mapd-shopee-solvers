@@ -6,7 +6,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
 from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.detour_utils import (
+    evaluate_detour_net_reward,
+    is_pickup_safe,
+)
 from solvers.solver import Solver
+from solvers.heuristic_utils import get_vrp_params, estimate_average_shortest_path
+
 
 
 Move = str
@@ -106,21 +112,8 @@ class VRPOrToolsSolver(Solver):
         self.T = t
         self.grid = grid
         self.bfs = BFS(grid)
-        if c <= 2:
-            self.travel_penalty = 0.012
-            self.late_penalty = 0.20
-        elif n >= 20:
-            self.travel_penalty = 0.135
-            self.late_penalty = 0.48
-        elif n >= 17:
-            self.travel_penalty = 0.075
-            self.late_penalty = 0.38
-        elif n >= 13:
-            self.travel_penalty = 0.06
-            self.late_penalty = 0.35
-        else:
-            self.travel_penalty = 0.04
-            self.late_penalty = 0.30
+        self.asd = estimate_average_shortest_path(grid, self.bfs)
+        self.travel_penalty, self.late_penalty = get_vrp_params(n, c, t, grid, self.bfs)
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -173,7 +166,7 @@ class VRPOrToolsSolver(Solver):
         return reward + 3.5 * order.p + self._visible_pickup_density(order, orders) + urgency - 0.28 * d1 - 0.10 * d2 - 0.85 * late
 
     def _candidate_pool(self, shipper: Shipper, orders: Dict[int, Order], now: int, limit: int = 34) -> List[Order]:
-        if self.N < 20:
+        if self.asd < 16.0:
             scored = []
             for order in orders.values():
                 if not self._can_take(shipper, order, orders):
@@ -230,7 +223,7 @@ class VRPOrToolsSolver(Solver):
                 continue
             if kind == "pickup":
                 if oid not in carried:
-                    if self.N >= 20 and (len(carried) >= shipper.K_max or load + order.w > shipper.W_max):
+                    if self.asd >= 16.0 and (len(carried) >= shipper.K_max or load + order.w > shipper.W_max):
                         return -INF
                     load += order.w
                     carried.add(oid)
@@ -241,9 +234,9 @@ class VRPOrToolsSolver(Solver):
                 value += reward - self.late_penalty * late
                 if oid in picked:
                     value += 1.0
-                    if self.N >= 20:
+                    if self.asd >= 16.0:
                         value += 0.15 * self._visible_pickup_density(order, orders)
-                if self.N >= 20:
+                if self.asd >= 16.0:
                     same_dest = sum(
                         1
                         for other_id in carried
@@ -316,6 +309,9 @@ class VRPOrToolsSolver(Solver):
                 for order in self._candidate_pool(shipper, orders, now, limit=30):
                     if order.id in assigned:
                         continue
+                    if shipper.bag and self.asd >= 5.0:
+                        if not is_pickup_safe(shipper, order, orders, now, (order.sx, order.sy), self.bfs.dist):
+                            continue
                     gain, new_route = self._best_insertion(shipper, routes[shipper.id], order, orders, now)
                     if new_route is None or gain <= 0:
                         continue
@@ -336,6 +332,9 @@ class VRPOrToolsSolver(Solver):
         candidates = []
         for shipper in shippers:
             for order in self._candidate_pool(shipper, orders, now, limit=18):
+                if shipper.bag and self.asd >= 5.0:
+                    if not is_pickup_safe(shipper, order, orders, now, (order.sx, order.sy), self.bfs.dist):
+                        continue
                 d1 = self.bfs.dist(shipper.position, (order.sx, order.sy))
                 d2 = self.bfs.dist((order.sx, order.sy), (order.ex, order.ey))
                 if d1 >= INF or d2 >= INF:
@@ -434,8 +433,17 @@ class VRPOrToolsSolver(Solver):
         for shipper in shippers:
             if self._deliverable(shipper, orders, shipper.position):
                 actions[shipper.id] = ("S", 2)
-            elif self._pickup_at(shipper, orders, shipper.position) is not None and not shipper.bag:
-                actions[shipper.id] = ("S", 1)
+            else:
+                here = self._pickup_at(shipper, orders, shipper.position)
+                if self.asd < 5.0:
+                    pickup_allowed = here is not None and not shipper.bag
+                else:
+                    pickup_allowed = here is not None and (
+                        not shipper.bag
+                        or is_pickup_safe(shipper, here, orders, now, shipper.position, self.bfs.dist)
+                    )
+                if pickup_allowed:
+                    actions[shipper.id] = ("S", 1)
 
         active = [s for s in shippers if s.id not in actions]
         routes = self._try_ortools_assignment(active, orders, now)

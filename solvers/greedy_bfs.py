@@ -6,7 +6,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
 from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.detour_utils import (
+    evaluate_detour_net_reward,
+    find_best_detour_target,
+    is_pickup_safe,
+)
 from solvers.solver import Solver
+from solvers.heuristic_utils import get_greedy_params, estimate_average_shortest_path
+
 
 
 Move = str
@@ -111,41 +118,14 @@ class GreedyBFS(Solver):
             for r in range(1, max(1, n - 1))
             for col in range(1, max(1, n - 1))
         )
-        if n >= 20:
-            self.pickup_priority_bonus = 3.5
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.70
-            self.pickup_density_base = 0.70
-            self.carry_pick_threshold = 999.0
-        elif n >= 17:
-            self.pickup_priority_bonus = 3.0
-            self.pickup_d1_penalty = 0.45
-            self.pickup_d2_penalty = 0.16
-            self.pickup_late_penalty = 0.60
-            self.pickup_density_base = 0.60
-            self.carry_pick_threshold = 22.0
-        elif n >= 13:
-            self.pickup_priority_bonus = 3.5
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.70
-            self.pickup_density_base = 0.70
-            self.carry_pick_threshold = 16.0
-        elif n >= 11:
-            self.pickup_priority_bonus = 3.5
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.70
-            self.pickup_density_base = 0.70
-            self.carry_pick_threshold = 999.0
-        else:
-            self.pickup_priority_bonus = 3.0
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.35
-            self.pickup_density_base = 0.60
-            self.carry_pick_threshold = 22.0
+        self.asd = estimate_average_shortest_path(grid, self.bfs)
+        params = get_greedy_params(n, c, t, grid, self.bfs)
+        self.pickup_priority_bonus = params["pickup_priority_bonus"]
+        self.pickup_d1_penalty = params["pickup_d1_penalty"]
+        self.pickup_d2_penalty = params["pickup_d2_penalty"]
+        self.pickup_late_penalty = params["pickup_late_penalty"]
+        self.pickup_density_base = params["pickup_density_base"]
+        self.carry_pick_threshold = params["carry_pick_threshold"]
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -250,127 +230,10 @@ class GreedyBFS(Solver):
         )[1]
 
     def _is_pickup_safe(self, shipper: Shipper, pickup_order: Order, orders: Dict[int, Order], now: int, start_pos: Position) -> bool:
-        if not shipper.bag:
-            return True
-        direct_times = {}
-        for oid in shipper.bag:
-            o = orders[oid]
-            d = self.bfs.dist(shipper.position, (o.ex, o.ey))
-            direct_times[oid] = now + d
-            
-        temp_bag = list(shipper.bag) + [pickup_order.id]
-        curr_pos = start_pos
-        curr_time = now
-        if curr_pos != shipper.position:
-            curr_time += self.bfs.dist(shipper.position, curr_pos)
-            
-        sim_times = {}
-        while temp_bag:
-            best_oid = None
-            best_key = (INF, 0, 0, 0)
-            for oid in temp_bag:
-                o = orders[oid]
-                d = self.bfs.dist(curr_pos, (o.ex, o.ey))
-                key = (d, o.et, -o.p, o.id)
-                if key < best_key:
-                    best_key = key
-                    best_oid = oid
-            if best_oid is None or best_key[0] >= INF:
-                return False
-            curr_time += best_key[0]
-            sim_times[best_oid] = curr_time
-            curr_pos = (orders[best_oid].ex, orders[best_oid].ey)
-            temp_bag.remove(best_oid)
-            
-        for oid in shipper.bag:
-            o = orders[oid]
-            if sim_times[oid] > o.et:
-                # If it was on-time but now becomes late, reject
-                if direct_times[oid] <= o.et:
-                    return False
-                # If it was already late, don't let it be delayed by more than 10 steps
-                if sim_times[oid] - direct_times[oid] > 10:
-                    return False
-        return True
+        return is_pickup_safe(shipper, pickup_order, orders, now, start_pos, self.bfs.dist)
 
     def _evaluate_detour_net_reward(self, shipper: Shipper, pickup_order: Order, orders: Dict[int, Order], now: int) -> float:
-        # Option A: Direct delivery of existing bag
-        temp_bag_direct = list(shipper.bag)
-        curr_pos = shipper.position
-        curr_time = now
-        r_direct = 0.0
-        c_direct = 0.0
-        
-        while temp_bag_direct:
-            best_oid = None
-            best_key = (INF, 0, 0, 0)
-            for oid in temp_bag_direct:
-                o = orders[oid]
-                d = self.bfs.dist(curr_pos, (o.ex, o.ey))
-                key = (d, o.et, -o.p, o.id)
-                if key < best_key:
-                    best_key = key
-                    best_oid = oid
-            
-            if best_oid is None or best_key[0] >= INF:
-                return -INF
-                
-            dist = best_key[0]
-            w_carried = sum(orders[oid].w for oid in temp_bag_direct)
-            cost_per_step = -0.01 * (1.0 + 1.0 * w_carried / max(shipper.W_max, 1.0))
-            c_direct += dist * cost_per_step
-            
-            curr_time += dist
-            r_direct += delivery_reward(orders[best_oid], curr_time, self.T)
-            
-            curr_pos = (orders[best_oid].ex, orders[best_oid].ey)
-            temp_bag_direct.remove(best_oid)
-            
-        # Option B: Detour to pickup new order first
-        temp_bag_detour = list(shipper.bag) + [pickup_order.id]
-        curr_pos = shipper.position
-        curr_time = now
-        r_detour = 0.0
-        c_detour = 0.0
-        
-        d_to_pickup = self.bfs.dist(shipper.position, (pickup_order.sx, pickup_order.sy))
-        if d_to_pickup >= INF:
-            return -INF
-            
-        w_carried = sum(orders[oid].w for oid in shipper.bag)
-        cost_per_step = -0.01 * (1.0 + 1.0 * w_carried / max(shipper.W_max, 1.0))
-        c_detour += d_to_pickup * cost_per_step
-        curr_time += d_to_pickup
-        curr_pos = (pickup_order.sx, pickup_order.sy)
-        
-        while temp_bag_detour:
-            best_oid = None
-            best_key = (INF, 0, 0, 0)
-            for oid in temp_bag_detour:
-                o = orders[oid]
-                d = self.bfs.dist(curr_pos, (o.ex, o.ey))
-                key = (d, o.et, -o.p, o.id)
-                if key < best_key:
-                    best_key = key
-                    best_oid = oid
-            
-            if best_oid is None or best_key[0] >= INF:
-                return -INF
-                
-            dist = best_key[0]
-            w_carried = sum(orders[oid].w for oid in temp_bag_detour)
-            cost_per_step = -0.01 * (1.0 + 1.0 * w_carried / max(shipper.W_max, 1.0))
-            c_detour += dist * cost_per_step
-            
-            curr_time += dist
-            r_detour += delivery_reward(orders[best_oid], curr_time, self.T)
-            
-            curr_pos = (orders[best_oid].ex, orders[best_oid].ey)
-            temp_bag_detour.remove(best_oid)
-            
-        net_direct = r_direct + c_direct
-        net_detour = r_detour + c_detour
-        return net_detour - net_direct
+        return evaluate_detour_net_reward(shipper, pickup_order, orders, now, self.bfs.dist, self.T)
 
     def _find_best_detour_target(
         self,
@@ -380,45 +243,9 @@ class GreedyBFS(Solver):
         reserved: set[int],
         shippers: List[Shipper]
     ) -> Optional[Order]:
-        best_order = None
-        best_delta = 0.0
-        min_threshold = 0.5
-        margin = 3
-        
-        empty_shippers = [s for s in shippers if not s.bag and s.id != shipper.id]
-        
-        for order in orders.values():
-            if order.id in reserved or not self._can_take(shipper, order, orders):
-                continue
-                
-            pickup_pos = (order.sx, order.sy)
-            d_to_pickup = self.bfs.dist(shipper.position, pickup_pos)
-            if d_to_pickup >= INF:
-                continue
-                
-            # Cooperative Deferral Check:
-            # If an empty shipper is closer or almost as close to the pickup as we are,
-            # defer to that empty shipper!
-            deferred = False
-            for empty_s in empty_shippers:
-                d_empty = self.bfs.dist(empty_s.position, pickup_pos)
-                if d_empty < d_to_pickup + margin:
-                    deferred = True
-                    break
-            if deferred:
-                continue
-                
-            # Verify safety
-            if not self._is_pickup_safe(shipper, order, orders, now, pickup_pos):
-                continue
-                
-            # Evaluate exact net reward
-            delta = self._evaluate_detour_net_reward(shipper, order, orders, now)
-            if delta > best_delta and delta >= min_threshold:
-                best_delta = delta
-                best_order = order
-                
-        return best_order
+        return find_best_detour_target(
+            shipper, orders, now, reserved, shippers, self.bfs.dist, self.T, self._can_take
+        )
 
     def _action_to(self, shipper: Shipper, goal: Position, op_if_arrive: int, orders: Dict[int, Order]) -> Action:
         move = self.bfs.next_move(shipper.position, goal)
@@ -470,8 +297,8 @@ class GreedyBFS(Solver):
                 continue
             here = self._pickup_at(shipper, orders, shipper.position)
             
-            # Disable detour/multiple carry for small grids (N < 10) to match optimal baseline
-            if self.N < 10:
+            # Disable detour/multiple carry for small grids (asd < 5.0) to match optimal baseline
+            if self.asd < 5.0:
                 pickup_allowed = here is not None and (not shipper.bag or self._pickup_score(shipper, here, orders, now) >= self.carry_pick_threshold)
             else:
                 pickup_allowed = here is not None and (not shipper.bag or (self._is_pickup_safe(shipper, here, orders, now, shipper.position) and self._evaluate_detour_net_reward(shipper, here, orders, now) > 0.0))
@@ -501,10 +328,11 @@ class GreedyBFS(Solver):
                 else:
                     self.shipper_commitments.pop(shipper.id, None)
             
+            detour_allowed = self.asd < 7.2 or self.T >= 700
             can_pickup_more = (
                 not shipper.bag
                 or (
-                    self.N >= 10 and self.N != 15
+                    detour_allowed
                     and len(shipper.bag) < shipper.K_max
                     and self._carried_weight(shipper, orders) < shipper.W_max
                 )

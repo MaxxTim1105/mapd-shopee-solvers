@@ -109,6 +109,17 @@ class MAPDCBSSolver(Solver):
         drop = (order.ex, order.ey)
         return self.bfs.dist(shipper.position, pickup) < INF and self.bfs.dist(pickup, drop) < INF
 
+    def _can_finish_before_end(self, shipper: Shipper, order: Order, now: int) -> bool:
+        pickup = (order.sx, order.sy)
+        drop = (order.ex, order.ey)
+        d1 = self.bfs.dist(shipper.position, pickup)
+        d2 = self.bfs.dist(pickup, drop)
+        if d1 >= INF or d2 >= INF:
+            return False
+        remaining = self.T - now
+        margin = max(1, min(7, remaining // 14))
+        return d1 + d2 + margin <= remaining
+
     def _deliverable(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> bool:
         return any((order.ex, order.ey) == pos for order in self._carried(shipper, orders))
 
@@ -162,6 +173,8 @@ class MAPDCBSSolver(Solver):
         for order in orders.values():
             if not self._can_take(shipper, order, orders):
                 continue
+            if not self._can_finish_before_end(shipper, order, now):
+                continue
             d1 = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
             d2 = abs(order.sx - order.ex) + abs(order.sy - order.ey)
             finish = now + d1 + d2
@@ -205,17 +218,61 @@ class MAPDCBSSolver(Solver):
             elif kind == "deliver" and oid in carried:
                 reward = delivery_reward(order, t, self.T)
                 late = max(0, t - order.et)
+                slack = order.et - t
                 same_dest = sum(
                     1
                     for other_id in carried
                     if other_id != oid and other_id in orders and (orders[other_id].ex, orders[other_id].ey) == target
                 )
-                value += reward - self.route_late_penalty * late + 0.8 * same_dest
+                low_slack_penalty = max(0.0, 4.0 - slack) * (0.05 + 0.03 * order.p)
+                value += reward - self.route_late_penalty * late - low_slack_penalty + 0.8 * same_dest
                 if oid in picked:
                     value += 0.7 + 0.2 * self._visible_drop_density(target, orders)
                 carried.remove(oid)
                 load -= order.w
         return value
+
+    def _carried_detour_risk(
+        self,
+        shipper: Shipper,
+        route: Sequence[Stop],
+        candidate: Sequence[Stop],
+        orders: Dict[int, Order],
+        now: int,
+    ) -> float:
+        carried_ids = set(shipper.bag)
+        if not carried_ids:
+            return 0.0
+
+        def finish_times(path: Sequence[Stop]) -> Dict[int, int]:
+            pos = shipper.position
+            t = now
+            result: Dict[int, int] = {}
+            for kind, oid, target in path:
+                d = self.bfs.dist(pos, target)
+                if d >= INF:
+                    return {}
+                t += d
+                pos = target
+                if kind == "deliver" and oid in carried_ids:
+                    result[oid] = t
+            return result
+
+        base_finish = finish_times(route)
+        candidate_finish = finish_times(candidate)
+        if len(candidate_finish) < len(carried_ids):
+            return INF
+        risk = 0.0
+        for oid in carried_ids:
+            order = orders.get(oid)
+            if order is None:
+                continue
+            base_t = base_finish.get(oid, now)
+            cand_t = candidate_finish.get(oid, INF)
+            delay = max(0, cand_t - base_t)
+            slack = order.et - cand_t
+            risk = max(risk, 1.3 * delay + 5.0 * max(0, -slack) + 0.7 * max(0, 3 - slack))
+        return risk
 
     def _initial_route(self, shipper: Shipper, orders: Dict[int, Order], now: int) -> List[Stop]:
         route: List[Stop] = []
@@ -249,7 +306,8 @@ class MAPDCBSSolver(Solver):
                 candidate.insert(i, pickup)
                 candidate.insert(j, deliver)
                 score = self._route_score(shipper, candidate, orders, now)
-                gain = score - base
+                risk = self._carried_detour_risk(shipper, route, candidate, orders, now)
+                gain = score - base - risk
                 if gain > best_gain:
                     best_gain = gain
                     best_route = candidate
@@ -282,6 +340,23 @@ class MAPDCBSSolver(Solver):
             assigned.add(oid)
             slots[sid] -= 1
         return routes
+
+    def _idle_pickup_target(self, shipper: Shipper, orders: Dict[int, Order], now: int) -> Optional[Order]:
+        if shipper.bag:
+            return None
+        candidates = []
+        for order in self._candidate_pool(shipper, orders, now):
+            score = self._pickup_value(shipper, order, orders, now)
+            if score <= 0:
+                continue
+            pickup_dist = self.bfs.dist(shipper.position, (order.sx, order.sy))
+            finish_dist = pickup_dist + self.bfs.dist((order.sx, order.sy), (order.ex, order.ey))
+            slack = min(order.et - (now + finish_dist), self.T - now - finish_dist)
+            candidates.append((score + 0.18 * max(0.0, slack) - 0.12 * pickup_dist, order.et, order.id, order))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return candidates[0][3]
 
     def _target_priority(self, shipper: Shipper, target: Optional[Tuple[str, int, Position]], orders: Dict[int, Order], now: int) -> float:
         if target is None:
@@ -406,6 +481,10 @@ class MAPDCBSSolver(Solver):
                 here = self._pickup_at(shipper, orders, shipper.position)
                 if here is not None and not shipper.bag:
                     targets[shipper.id] = ("pickup", here.id, (here.sx, here.sy))
+                else:
+                    idle_order = self._idle_pickup_target(shipper, orders, now)
+                    if idle_order is not None:
+                        targets[shipper.id] = ("pickup", idle_order.id, (idle_order.sx, idle_order.sy))
             priorities[shipper.id] = self._target_priority(shipper, targets.get(shipper.id), orders, now)
 
         paths = self._plan_paths(active, targets, priorities)

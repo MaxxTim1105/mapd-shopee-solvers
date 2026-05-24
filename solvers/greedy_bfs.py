@@ -109,41 +109,17 @@ class GreedyBFS(Solver):
             for r in range(1, max(1, n - 1))
             for col in range(1, max(1, n - 1))
         )
-        if n >= 20:
-            self.pickup_priority_bonus = 3.5
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.70
-            self.pickup_density_base = 0.70
-            self.carry_pick_threshold = 999.0
-        elif n >= 17:
-            self.pickup_priority_bonus = 3.0
-            self.pickup_d1_penalty = 0.45
-            self.pickup_d2_penalty = 0.16
-            self.pickup_late_penalty = 0.60
-            self.pickup_density_base = 0.60
-            self.carry_pick_threshold = 22.0
-        elif n >= 13:
-            self.pickup_priority_bonus = 3.5
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.70
-            self.pickup_density_base = 0.70
-            self.carry_pick_threshold = 16.0
-        elif n >= 11:
-            self.pickup_priority_bonus = 3.5
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.70
-            self.pickup_density_base = 0.70
-            self.carry_pick_threshold = 999.0
-        else:
-            self.pickup_priority_bonus = 3.0
-            self.pickup_d1_penalty = 0.35
-            self.pickup_d2_penalty = 0.12
-            self.pickup_late_penalty = 0.35
-            self.pickup_density_base = 0.60
-            self.carry_pick_threshold = 22.0
+        cells = max(1, n * n)
+        blocked = sum(1 for row in grid for cell in row if cell != 0)
+        obstacle_density = blocked / cells
+        map_scale = min(1.0, max(0.0, (n - 6) / max(1.0, n + 6)))
+        agent_pressure = min(1.0, c / max(1.0, n))
+        self.pickup_priority_bonus = 3.0 + 0.45 * (1.0 - map_scale) + 0.25 * agent_pressure
+        self.pickup_d1_penalty = 0.30 + 0.18 * map_scale + 0.15 * obstacle_density
+        self.pickup_d2_penalty = 0.09 + 0.08 * map_scale + 0.06 * obstacle_density
+        self.pickup_late_penalty = 0.38 + 0.36 * map_scale + 0.12 * agent_pressure
+        self.pickup_density_base = 0.55 + 0.20 * map_scale + 0.20 * obstacle_density
+        self.carry_pick_threshold = 14.0 + 18.0 * map_scale + 8.0 * obstacle_density
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -156,6 +132,17 @@ class GreedyBFS(Solver):
         pickup = (order.sx, order.sy)
         drop = (order.ex, order.ey)
         return self.bfs.dist(shipper.position, pickup) < INF and self.bfs.dist(pickup, drop) < INF
+
+    def _can_finish_before_end(self, shipper: Shipper, order: Order, now: int) -> bool:
+        pickup = (order.sx, order.sy)
+        drop = (order.ex, order.ey)
+        d1 = self.bfs.dist(shipper.position, pickup)
+        d2 = self.bfs.dist(pickup, drop)
+        if d1 >= INF or d2 >= INF:
+            return False
+        remaining = self.T - now
+        margin = max(1, min(6, remaining // 12))
+        return d1 + d2 + margin <= remaining
 
     def _carried(self, shipper: Shipper, orders: Dict[int, Order]) -> List[Order]:
         return [orders[oid] for oid in shipper.bag if oid in orders and not orders[oid].delivered]
@@ -210,10 +197,46 @@ class GreedyBFS(Solver):
             - self.pickup_late_penalty * late
         )
 
+    def _safe_pickup_while_carrying(self, shipper: Shipper, order: Order, orders: Dict[int, Order], now: int) -> bool:
+        carried = self._carried(shipper, orders)
+        if not carried:
+            return True
+        pickup = (order.sx, order.sy)
+        to_pickup = self.bfs.dist(shipper.position, pickup)
+        if to_pickup >= INF:
+            return False
+
+        direct_slacks = []
+        detour_slacks = []
+        extra_costs = []
+        for carried_order in carried:
+            drop = (carried_order.ex, carried_order.ey)
+            direct = self.bfs.dist(shipper.position, drop)
+            via_pickup = to_pickup + self.bfs.dist(pickup, drop)
+            if direct >= INF or via_pickup >= INF:
+                return False
+            direct_slacks.append(carried_order.et - (now + direct))
+            detour_slacks.append(carried_order.et - (now + via_pickup))
+            extra_costs.append(max(0, via_pickup - direct))
+
+        worst_direct_slack = min(direct_slacks)
+        worst_detour_slack = min(detour_slacks)
+        extra = max(extra_costs)
+        urgency_margin = max(1.0, 0.30 * max(0.0, worst_direct_slack) + 1.5 * order.p)
+        score_after_risk = (
+            self._pickup_score(shipper, order, orders, now)
+            - 1.6 * extra
+            - 5.0 * max(0.0, -worst_detour_slack)
+            - 0.8 * max(0.0, 4.0 - worst_detour_slack)
+        )
+        return extra <= urgency_margin and score_after_risk >= self.carry_pick_threshold
+
     def _pickup_target(self, shipper: Shipper, orders: Dict[int, Order], now: int, reserved: set[int]) -> Optional[Order]:
         rough = []
         for order in orders.values():
             if order.id in reserved or not self._can_take(shipper, order, orders):
+                continue
+            if not self._can_finish_before_end(shipper, order, now):
                 continue
             d = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
             rough.append((4.0 * order.p - 0.25 * d - 0.02 * max(0, order.et - now), order))
@@ -286,7 +309,7 @@ class GreedyBFS(Solver):
                 actions[shipper.id] = ("S", 2)
                 continue
             here = self._pickup_at(shipper, orders, shipper.position)
-            if here is not None and (not shipper.bag or self._pickup_score(shipper, here, orders, now) >= self.carry_pick_threshold):
+            if here is not None and self._safe_pickup_while_carrying(shipper, here, orders, now):
                 actions[shipper.id] = ("S", 1)
                 reserved.add(here.id)
                 continue

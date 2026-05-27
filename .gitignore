@@ -1,5 +1,5 @@
 __pycache__/
 *.pyc
-results/
-results_phase1*/
+
+results*/
 .ipynb_checkpoints/

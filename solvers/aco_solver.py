@@ -29,6 +29,7 @@ MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
 class BFS:
     def __init__(self, grid: List[List[int]]):
         self.grid = grid
+        self.sssp_cache: Dict[Position, Dict[Position, int]] = {}
         self.dist_cache: Dict[Tuple[Position, Position], int] = {}
         self.move_cache: Dict[Tuple[Position, Position], Move] = {}
 
@@ -38,31 +39,34 @@ class BFS:
             if nxt != pos:
                 yield move, nxt
 
-    def dist(self, start: Position, goal: Position) -> int:
-        if start == goal:
-            return 0
-        key = (start, goal)
-        if key in self.dist_cache:
-            return self.dist_cache[key]
-        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
-            self.dist_cache[key] = INF
-            return INF
+    def get_all_dists(self, start: Position) -> Dict[Position, int]:
+        if start in self.sssp_cache:
+            return self.sssp_cache[start]
+        if not is_valid_cell(start, self.grid):
+            return {}
         q = deque([start])
         dist = {start: 0}
         while q:
             pos = q.popleft()
+            d = dist[pos]
             for _, nxt in self.neighbors(pos):
-                if nxt in dist:
-                    continue
-                nd = dist[pos] + 1
-                if nxt == goal:
-                    self.dist_cache[key] = nd
-                    self.dist_cache[(goal, start)] = nd
-                    return nd
-                dist[nxt] = nd
-                q.append(nxt)
-        self.dist_cache[key] = INF
-        return INF
+                if nxt not in dist:
+                    dist[nxt] = d + 1
+                    q.append(nxt)
+        self.sssp_cache[start] = dist
+        return dist
+
+    def dist(self, start: Position, goal: Position) -> int:
+        if start == goal:
+            return 0
+        if start in self.sssp_cache:
+            return self.sssp_cache[start].get(goal, INF)
+        if goal in self.sssp_cache:
+            return self.sssp_cache[goal].get(start, INF)
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            return INF
+        dist_map = self.get_all_dists(start)
+        return dist_map.get(goal, INF)
 
     def next_move(self, start: Position, goal: Position) -> Move:
         if start == goal:
@@ -70,20 +74,28 @@ class BFS:
         key = (start, goal)
         if key in self.move_cache:
             return self.move_cache[key]
-        q = deque([start])
-        first = {start: "S"}
-        while q:
-            pos = q.popleft()
-            for move, nxt in self.neighbors(pos):
-                if nxt in first:
-                    continue
-                first[nxt] = move if pos == start else first[pos]
-                if nxt == goal:
-                    self.move_cache[key] = first[nxt]
-                    return first[nxt]
-                q.append(nxt)
-        self.move_cache[key] = "S"
-        return "S"
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            self.move_cache[key] = "S"
+            return "S"
+        
+        dist_map = self.get_all_dists(goal)
+        start_d = dist_map.get(start, INF)
+        if start_d >= INF:
+            self.move_cache[key] = "S"
+            return "S"
+            
+        best_move = "S"
+        best_d = start_d
+        for move in MOVES:
+            nxt = valid_next_pos(start, move, self.grid)
+            if nxt != start:
+                nd = dist_map.get(nxt, INF)
+                if nd < best_d:
+                    best_d = nd
+                    best_move = move
+                    
+        self.move_cache[key] = best_move
+        return best_move
 
     def after(self, pos: Position, move: Move) -> Position:
         return valid_next_pos(pos, move, self.grid)

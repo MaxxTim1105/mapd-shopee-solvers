@@ -27,6 +27,7 @@ ALL_MOVES: Tuple[Move, ...] = ("S", "U", "D", "L", "R")
 class BFS:
     def __init__(self, grid: List[List[int]]):
         self.grid = grid
+        self.sssp_cache: Dict[Position, Dict[Position, int]] = {}
         self.dist_cache: Dict[Tuple[Position, Position], int] = {}
 
     def neighbors(self, pos: Position, include_wait: bool = False) -> Iterable[Tuple[Move, Position]]:
@@ -36,31 +37,34 @@ class BFS:
             if move == "S" or nxt != pos:
                 yield move, nxt
 
-    def dist(self, start: Position, goal: Position) -> int:
-        if start == goal:
-            return 0
-        key = (start, goal)
-        if key in self.dist_cache:
-            return self.dist_cache[key]
-        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
-            self.dist_cache[key] = INF
-            return INF
+    def get_all_dists(self, start: Position) -> Dict[Position, int]:
+        if start in self.sssp_cache:
+            return self.sssp_cache[start]
+        if not is_valid_cell(start, self.grid):
+            return {}
         q = deque([start])
         dist = {start: 0}
         while q:
             pos = q.popleft()
-            for _, nxt in self.neighbors(pos):
-                if nxt in dist:
-                    continue
-                nd = dist[pos] + 1
-                if nxt == goal:
-                    self.dist_cache[key] = nd
-                    self.dist_cache[(goal, start)] = nd
-                    return nd
-                dist[nxt] = nd
-                q.append(nxt)
-        self.dist_cache[key] = INF
-        return INF
+            d = dist[pos]
+            for _, nxt in self.neighbors(pos, include_wait=False):
+                if nxt not in dist:
+                    dist[nxt] = d + 1
+                    q.append(nxt)
+        self.sssp_cache[start] = dist
+        return dist
+
+    def dist(self, start: Position, goal: Position) -> int:
+        if start == goal:
+            return 0
+        if start in self.sssp_cache:
+            return self.sssp_cache[start].get(goal, INF)
+        if goal in self.sssp_cache:
+            return self.sssp_cache[goal].get(start, INF)
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            return INF
+        dist_map = self.get_all_dists(start)
+        return dist_map.get(goal, INF)
 
     def move_between(self, a: Position, b: Position) -> Move:
         if a == b:

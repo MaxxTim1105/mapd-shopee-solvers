@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict, deque
+from itertools import permutations
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, valid_next_pos
@@ -93,10 +94,8 @@ class MAPDCBSSolver(Solver):
         self.pickup_tasks: Dict[int, int] = {}
         self.replanned_tasks: Dict[int, int] = {}
         self.delivery_commitments: Dict[int, int] = {}
+        self.bundle_followups: Dict[int, int] = {}
         self.failed_assignment_retry: Dict[int, int] = {}
-        self.seen_orders: Set[int] = set()
-        self.pickup_heat: Dict[Position, int] = {}
-        self.pickup_last_seen: Dict[Position, int] = {}
         self.run_deadline = 0.0
         self.repairs = 0
         self.repair_search_budget = 0
@@ -114,10 +113,8 @@ class MAPDCBSSolver(Solver):
         self.pickup_tasks.clear()
         self.replanned_tasks.clear()
         self.delivery_commitments.clear()
+        self.bundle_followups.clear()
         self.failed_assignment_retry.clear()
-        self.seen_orders.clear()
-        self.pickup_heat.clear()
-        self.pickup_last_seen.clear()
 
     def _mdist(self, a: Position, b: Position) -> int:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -172,15 +169,6 @@ class MAPDCBSSolver(Solver):
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1), (-2, 0), (2, 0), (0, -2), (0, 2)):
             value += (0.45 if abs(dr) + abs(dc) == 1 else 0.20) * counts.get((r + dr, c + dc), 0)
         return value
-
-    def _observe_pickups(self, orders: Dict[int, Order], now: int) -> None:
-        for order in orders.values():
-            if order.id in self.seen_orders:
-                continue
-            self.seen_orders.add(order.id)
-            pickup = (order.sx, order.sy)
-            self.pickup_heat[pickup] = self.pickup_heat.get(pickup, 0) + 1
-            self.pickup_last_seen[pickup] = now
 
     def _delivery_target(self, shipper: Shipper, orders: Dict[int, Order], now: int) -> Optional[Order]:
         carried = self._carried(shipper, orders)
@@ -237,6 +225,189 @@ class MAPDCBSSolver(Solver):
         late = max(0, finish - passing.et)
         score = reward + 28.0 * reward / (onward + 8.0) - 0.12 * onward - 0.28 * late
         return new_drop == primary_drop or score >= 10.0
+
+    def _can_add_orders(self, shipper: Shipper, additions: List[Order], orders: Dict[int, Order]) -> bool:
+        if any(order.picked or order.delivered for order in additions):
+            return False
+        carried = self._carried(shipper, orders)
+        return (
+            len(carried) + len(additions) <= shipper.K_max
+            and sum(order.w for order in carried) + sum(order.w for order in additions) <= shipper.W_max
+        )
+
+    def _best_delivery_plan(
+        self,
+        start: Position,
+        now: int,
+        cargo: List[Order],
+    ) -> Optional[Tuple[float, Set[int], int]]:
+        """Evaluate short delivery sequences after a bundled pickup."""
+        grouped: Dict[Position, List[Order]] = {}
+        for order in cargo:
+            grouped.setdefault((order.ex, order.ey), []).append(order)
+        if not grouped:
+            return (0.0, set(), now)
+
+        drops = list(grouped)
+        if len(drops) <= 5:
+            sequences = permutations(drops)
+        else:
+            sequences = [
+                tuple(
+                    sorted(
+                        drops,
+                        key=lambda drop: (
+                            min(order.et for order in grouped[drop]),
+                            self.router.distance(start, drop),
+                            drop,
+                        ),
+                    )
+                )
+            ]
+
+        best: Optional[Tuple[float, Set[int], int]] = None
+        best_key: Optional[Tuple[int, float, int]] = None
+        for sequence in sequences:
+            pos = start
+            finish = now
+            travel = 0
+            reward = 0.0
+            on_time: Set[int] = set()
+            feasible = True
+            for drop in sequence:
+                dist = self.router.distance(pos, drop)
+                if dist >= INF:
+                    feasible = False
+                    break
+                travel += dist
+                finish += dist
+                for order in grouped[drop]:
+                    reward += delivery_reward(order, finish, self.T)
+                    if finish <= order.et:
+                        on_time.add(order.id)
+                pos = drop
+            if not feasible:
+                continue
+            value = reward - 0.10 * travel
+            key = (len(on_time), value, -finish)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = (value, on_time, finish)
+        return best
+
+    def _best_loaded_bundle_pickup(
+        self,
+        shipper: Shipper,
+        delivery: Order,
+        orders: Dict[int, Order],
+        now: int,
+        excluded: Set[int],
+        deadline: float,
+    ) -> Optional[Order]:
+        """Choose one extra pickup only when existing on-time deliveries stay protected."""
+        followup_oid = self.bundle_followups.get(shipper.id)
+        if followup_oid is None:
+            return None
+        carried = self._carried(shipper, orders)
+        if len(carried) != 1 or len(carried) >= shipper.K_max:
+            self.bundle_followups.pop(shipper.id, None)
+            return None
+        baseline = self._best_delivery_plan(shipper.position, now, carried)
+        if baseline is None:
+            return None
+        baseline_value, baseline_on_time, _ = baseline
+        committed_oid = self.pickup_tasks.get(shipper.id)
+        rough: List[Tuple[float, int, Order]] = []
+        for order in orders.values():
+            if time.perf_counter() > deadline:
+                break
+            if (
+                order.id != followup_oid
+                or order.id in excluded
+                or order.id in shipper.bag
+                or not self._can_add_orders(shipper, [order], orders)
+            ):
+                continue
+            pickup = (order.sx, order.sy)
+            cheap_dist = self._mdist(shipper.position, pickup)
+            cheap_trip = self._mdist(pickup, (order.ex, order.ey))
+            cheap_finish = now + max(1, cheap_dist) + cheap_trip
+            if cheap_finish >= self.T:
+                continue
+            rough_value = (
+                delivery_reward(order, cheap_finish, self.T)
+                + 8.0 * order.p
+                - 0.18 * cheap_dist
+                - 0.08 * cheap_trip
+                + (18.0 if order.id == committed_oid else 0.0)
+            )
+            rough.append((rough_value, order.id, order))
+        rough.sort(key=lambda item: (-item[0], item[1]))
+        candidate_cap = max(5, min(12, 5 + self.C // 3))
+        if committed_oid is not None:
+            rough.sort(key=lambda item: (item[2].id != committed_oid, -item[0], item[1]))
+
+        best: Optional[Order] = None
+        best_key: Optional[Tuple[float, int, int]] = None
+        for _, _, order in rough[:candidate_cap]:
+            if time.perf_counter() > deadline:
+                break
+            pickup = (order.sx, order.sy)
+            d_pickup = self.router.distance(shipper.position, pickup)
+            if d_pickup >= INF:
+                continue
+            pickup_time = now + max(1, d_pickup)
+            plan = self._best_delivery_plan(pickup, pickup_time, carried + [order])
+            if plan is None:
+                continue
+            value, on_time, finish = plan
+            if not baseline_on_time.issubset(on_time) or order.id not in on_time:
+                continue
+            gain = value - baseline_value - 0.10 * d_pickup
+            if gain <= 0.0:
+                continue
+            if order.id == committed_oid:
+                return order
+            key = (gain + (8.0 if order.id == committed_oid else 0.0), order.p, -finish)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = order
+        if best is None:
+            self.bundle_followups.pop(shipper.id, None)
+        return best
+
+    def _pickup_before_committed_target(
+        self,
+        shipper: Shipper,
+        primary: Order,
+        orders: Dict[int, Order],
+        now: int,
+    ) -> Optional[Order]:
+        """Take a visible order underfoot when it can be bundled with the assigned pickup."""
+        auxiliary = self._pickup_at(shipper, orders, shipper.position)
+        if auxiliary is None or auxiliary.id == primary.id:
+            return None
+        if auxiliary.p >= primary.p:
+            return None
+        if (auxiliary.sx, auxiliary.sy) == (primary.sx, primary.sy):
+            return None
+        if not self._can_add_orders(shipper, [auxiliary, primary], orders):
+            return None
+        direct_delivery = self.router.distance(shipper.position, (auxiliary.ex, auxiliary.ey))
+        if direct_delivery >= INF or auxiliary.et - (now + 1 + direct_delivery) > 12:
+            return None
+        if self.router.distance((auxiliary.ex, auxiliary.ey), (primary.ex, primary.ey)) > 8:
+            return None
+        primary_pickup = (primary.sx, primary.sy)
+        to_primary = self.router.distance(shipper.position, primary_pickup)
+        if to_primary >= INF:
+            return None
+        pickup_time = now + 1 + max(1, to_primary)
+        plan = self._best_delivery_plan(primary_pickup, pickup_time, [auxiliary, primary])
+        if plan is None:
+            return None
+        _, on_time, _ = plan
+        return auxiliary if auxiliary.id in on_time and primary.id in on_time else None
 
     def _rough_pickup_score(
         self,
@@ -346,12 +517,19 @@ class MAPDCBSSolver(Solver):
             return None
         return order
 
-    def _assign_pickups(self, idle: List[Shipper], orders: Dict[int, Order], now: int, step_deadline: float) -> None:
+    def _assign_pickups(
+        self,
+        idle: List[Shipper],
+        orders: Dict[int, Order],
+        now: int,
+        step_deadline: float,
+        excluded_orders: Optional[Set[int]] = None,
+    ) -> None:
         if not idle:
             return
         pickup_counts, drop_counts = self._visible_density(orders)
         self.replanned_tasks.clear()
-        used_orders: Set[int] = set()
+        used_orders: Set[int] = set(excluded_orders or ())
         used_cells: Dict[Position, int] = {}
         pending: List[Shipper] = []
         reconsider_dist = max(8, min(14, self.N // 7 + 4))
@@ -477,44 +655,6 @@ class MAPDCBSSolver(Solver):
         slack = order.et - (now + dist)
         return 50.0 + 5.0 * order.p + max(0.0, 20.0 - slack) * 0.1 - 0.06 * dist
 
-    def _stage_idle(self, idle: List[Shipper], occupied_goals: Set[Position], now: int) -> Dict[int, Position]:
-        if self.C < 15 or not idle or now >= self.T - self._endgame_window():
-            return {}
-        age_scale = max(20.0, self.T / 12.0)
-        ranked_cells: List[Tuple[float, Position]] = []
-        for cell, heat in self.pickup_heat.items():
-            if heat < 3 or cell in occupied_goals:
-                continue
-            age = now - self.pickup_last_seen.get(cell, now)
-            observed_value = heat / (1.0 + age / age_scale)
-            if observed_value >= 1.0:
-                ranked_cells.append((observed_value, cell))
-        ranked_cells.sort(key=lambda item: (-item[0], item[1]))
-        ranked_cells = ranked_cells[: max(4, min(12, self.C // 2))]
-        if not ranked_cells:
-            return {}
-
-        pair_values: List[Tuple[float, int, Position]] = []
-        for shipper in idle:
-            for observed_value, cell in ranked_cells:
-                dist = self.router.distance(shipper.position, cell)
-                if dist <= 0 or dist >= INF:
-                    continue
-                value = observed_value / (1.0 + 0.10 * dist)
-                if value >= 0.45:
-                    pair_values.append((value, shipper.id, cell))
-        stage_limit = 1
-        assignments: Dict[int, Position] = {}
-        used_cells: Set[Position] = set()
-        for _, sid, cell in sorted(pair_values, key=lambda item: (-item[0], item[1], item[2])):
-            if len(assignments) >= stage_limit:
-                break
-            if sid in assignments or cell in used_cells:
-                continue
-            assignments[sid] = cell
-            used_cells.add(cell)
-        return assignments
-
     def _reserved_path(
         self,
         start: Position,
@@ -601,7 +741,7 @@ class MAPDCBSSolver(Solver):
     def _plan_paths(
         self,
         shippers: List[Shipper],
-        targets: Dict[int, Tuple[str, Optional[Order], Position]],
+        targets: Dict[int, Tuple[str, Order, Position]],
         priorities: Dict[int, float],
         staying: Set[int],
     ) -> Dict[int, List[Position]]:
@@ -625,12 +765,18 @@ class MAPDCBSSolver(Solver):
         now = int(obs["t"])
         orders: Dict[int, Order] = obs["orders"]
         shippers: List[Shipper] = list(obs["shippers"])
-        self._observe_pickups(orders, now)
         actions: Dict[int, Action] = {}
-        targets: Dict[int, Tuple[str, Optional[Order], Position]] = {}
+        targets: Dict[int, Tuple[str, Order, Position]] = {}
         priorities: Dict[int, float] = {}
         staying: Set[int] = set()
         idle: List[Shipper] = []
+        for sid, oid in list(self.bundle_followups.items()):
+            followup = orders.get(oid)
+            if followup is None or followup.picked or followup.delivered:
+                self.bundle_followups.pop(sid, None)
+        reserved_pickups: Set[int] = set()
+        bundle_budget = 0.008 if cheap_only else min(0.08, 0.010 + 0.004 * max(1, self.C))
+        bundle_deadline = time.perf_counter() + bundle_budget
 
         for shipper in shippers:
             if self._deliverable(shipper, orders, shipper.position):
@@ -638,9 +784,26 @@ class MAPDCBSSolver(Solver):
                 staying.add(shipper.id)
                 self.pickup_tasks.pop(shipper.id, None)
                 self.delivery_commitments.pop(shipper.id, None)
+                self.bundle_followups.pop(shipper.id, None)
                 continue
             delivery = self._delivery_target(shipper, orders, now)
             if delivery is not None:
+                bundle = self._best_loaded_bundle_pickup(
+                    shipper,
+                    delivery,
+                    orders,
+                    now,
+                    reserved_pickups,
+                    bundle_deadline,
+                )
+                if bundle is not None:
+                    goal = (bundle.sx, bundle.sy)
+                    targets[shipper.id] = ("pickup", bundle, goal)
+                    priorities[shipper.id] = self._target_priority(shipper, "deliver", delivery, now) + 1.0
+                    self.pickup_tasks[shipper.id] = bundle.id
+                    self.delivery_commitments[shipper.id] = delivery.id
+                    reserved_pickups.add(bundle.id)
+                    continue
                 goal = (delivery.ex, delivery.ey)
                 targets[shipper.id] = ("deliver", delivery, goal)
                 priorities[shipper.id] = self._target_priority(shipper, "deliver", delivery, now)
@@ -648,14 +811,12 @@ class MAPDCBSSolver(Solver):
                 continue
             idle.append(shipper)
 
-        fresh_orders = bool(obs.get("new_order_ids", []))
         assignable = [
             shipper
             for shipper in idle
             if (
                 now >= self.failed_assignment_retry.get(shipper.id, -1)
                 or shipper.id in self.pickup_tasks
-                or (fresh_orders and self.C >= 15)
             )
         ]
         if cheap_only:
@@ -664,17 +825,27 @@ class MAPDCBSSolver(Solver):
             step_budget = min(0.90, 0.12 + 0.032 * max(1, len(assignable)))
         else:
             step_budget = min(0.42, 0.04 + 0.014 * max(1, len(assignable)))
-        self._assign_pickups(assignable, orders, now, time.perf_counter() + step_budget)
+        self._assign_pickups(assignable, orders, now, time.perf_counter() + step_budget, reserved_pickups)
 
-        unassigned_idle: List[Shipper] = []
         for shipper in idle:
             oid = self.pickup_tasks.get(shipper.id)
             order = orders.get(oid) if oid is not None else None
             if order is None or order.picked or not self._can_take_light(shipper, order, orders):
                 self.pickup_tasks.pop(shipper.id, None)
-                unassigned_idle.append(shipper)
+                actions[shipper.id] = ("S", 0)
+                staying.add(shipper.id)
                 continue
             pickup = (order.sx, order.sy)
+            auxiliary = self._pickup_before_committed_target(shipper, order, orders, now)
+            if auxiliary is not None:
+                for other_sid, other_oid in list(self.pickup_tasks.items()):
+                    if other_sid != shipper.id and other_oid == auxiliary.id:
+                        self.pickup_tasks.pop(other_sid, None)
+                actions[shipper.id] = ("S", 1)
+                staying.add(shipper.id)
+                reserved_pickups.add(auxiliary.id)
+                self.bundle_followups[shipper.id] = order.id
+                continue
             if shipper.position == pickup:
                 actions[shipper.id] = ("S", 1)
                 staying.add(shipper.id)
@@ -682,22 +853,12 @@ class MAPDCBSSolver(Solver):
             targets[shipper.id] = ("pickup", order, pickup)
             priorities[shipper.id] = self._target_priority(shipper, "pickup", order, now)
 
-        staging = self._stage_idle(unassigned_idle, {target[2] for target in targets.values()}, now)
-        for shipper in unassigned_idle:
-            goal = staging.get(shipper.id)
-            if goal is None:
-                actions[shipper.id] = ("S", 0)
-                staying.add(shipper.id)
-                continue
-            targets[shipper.id] = ("stage", None, goal)
-            priorities[shipper.id] = 1.0
-
         paths = self._plan_paths(shippers, targets, priorities, staying)
         target_positions: Dict[int, Position] = {}
         claimed_pickups = {
             target_order.id
             for target_kind, target_order, _ in targets.values()
-            if target_kind == "pickup" and target_order is not None
+            if target_kind == "pickup"
         }
         for sid, (kind, order, goal) in targets.items():
             shipper = next(s for s in shippers if s.id == sid)
@@ -710,7 +871,7 @@ class MAPDCBSSolver(Solver):
                     op = 1
                 elif kind == "deliver":
                     op = 2
-            elif kind == "deliver" and order is not None and len(shipper.bag) < shipper.K_max:
+            elif kind == "deliver" and len(shipper.bag) < shipper.K_max:
                 passing = self._pickup_at(shipper, orders, nxt)
                 if (
                     passing is not None

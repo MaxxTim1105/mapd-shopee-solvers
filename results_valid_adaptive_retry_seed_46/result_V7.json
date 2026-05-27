@@ -1,0 +1,49 @@
+{
+  "config_name": "V7",
+  "orders_total_fixed": 1200,
+  "online_generation": true,
+  "results": [
+    {
+      "method": "MAPDCBSSolver",
+      "config_name": "V7",
+      "total_orders": 1200,
+      "orders_generated": 1200,
+      "delivered": 524,
+      "on_time": 396,
+      "late": 128,
+      "missed": 676,
+      "delivery_rate": 43.666666666666664,
+      "on_time_rate": 75.57251908396947,
+      "total_reward": 7256.6374,
+      "total_movecost": -381.3361,
+      "net_reward": 6875.3013,
+      "elapsed_sec": 20.6955,
+      "shipper_rewards": [
+        239.8615,
+        257.6183,
+        326.0896,
+        236.2598,
+        498.2776,
+        236.6316,
+        174.8922,
+        408.7151,
+        380.2294,
+        331.3535,
+        237.1142,
+        420.2908,
+        271.7627,
+        394.4782,
+        400.0746,
+        247.5289,
+        239.8456,
+        322.2553,
+        318.5832,
+        392.9303,
+        243.0385,
+        297.4701
+      ],
+      "status": "OK",
+      "wall_sec": 20.92
+    }
+  ]
+}

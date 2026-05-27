@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import time
+from collections import deque
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
+from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.solver import Solver
+
+
+Move = str
+Position = Tuple[int, int]
+Action = Tuple[Move, int]
+INF = 10**8
+MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
+
+
+class BFS:
+    def __init__(self, grid: List[List[int]]):
+        self.grid = grid
+        self.dist_cache: Dict[Tuple[Position, Position], int] = {}
+        self.move_cache: Dict[Tuple[Position, Position], Move] = {}
+
+    def neighbors(self, pos: Position) -> Iterable[Tuple[Move, Position]]:
+        for move in MOVES:
+            nxt = valid_next_pos(pos, move, self.grid)
+            if nxt != pos:
+                yield move, nxt
+
+    def dist(self, start: Position, goal: Position) -> int:
+        if start == goal:
+            return 0
+        key = (start, goal)
+        if key in self.dist_cache:
+            return self.dist_cache[key]
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            self.dist_cache[key] = INF
+            return INF
+        q = deque([start])
+        dist = {start: 0}
+        while q:
+            pos = q.popleft()
+            for _, nxt in self.neighbors(pos):
+                if nxt in dist:
+                    continue
+                nd = dist[pos] + 1
+                if nxt == goal:
+                    self.dist_cache[key] = nd
+                    self.dist_cache[(goal, start)] = nd
+                    return nd
+                dist[nxt] = nd
+                q.append(nxt)
+        self.dist_cache[key] = INF
+        return INF
+
+    def next_move(self, start: Position, goal: Position) -> Move:
+        if start == goal:
+            return "S"
+        key = (start, goal)
+        if key in self.move_cache:
+            return self.move_cache[key]
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            self.move_cache[key] = "S"
+            return "S"
+        q = deque([start])
+        first = {start: "S"}
+        while q:
+            pos = q.popleft()
+            for move, nxt in self.neighbors(pos):
+                if nxt in first:
+                    continue
+                first[nxt] = move if pos == start else first[pos]
+                if nxt == goal:
+                    self.move_cache[key] = first[nxt]
+                    return first[nxt]
+                q.append(nxt)
+        self.move_cache[key] = "S"
+        return "S"
+
+    def after(self, pos: Position, move: Move) -> Position:
+        return valid_next_pos(pos, move, self.grid)
+
+
+class GreedyBFS(Solver):
+    """Pure greedy online baseline using BFS shortest paths."""
+
+    method_name = "GreedyBFS"
+
+    def __init__(self, env: DeliveryEnv):
+        super().__init__(env)
+        self.bfs: Optional[BFS] = None
+        self.run_deadline = 0.0
+        self.grid: List[List[int]] = [[0]]
+        self.N = 1
+        self.C = 1
+        self.T = 1
+        self.has_inner_obstacles = False
+        self._configure_by_observation(1, 1, 1, [[0]])
+
+    def _configure_by_observation(self, n: int, c: int, t: int, grid: List[List[int]]) -> None:
+        self.N = n
+        self.C = c
+        self.T = t
+        self.grid = grid
+        self.bfs = BFS(grid)
+        self.has_inner_obstacles = any(
+            grid[r][col] != 0
+            for r in range(1, max(1, n - 1))
+            for col in range(1, max(1, n - 1))
+        )
+        cells = max(1, n * n)
+        blocked = sum(1 for row in grid for cell in row if cell != 0)
+        obstacle_density = blocked / cells
+        map_scale = min(1.0, max(0.0, (n - 6) / max(1.0, n + 6)))
+        agent_pressure = min(1.0, c / max(1.0, n))
+        self.pickup_priority_bonus = 3.0 + 0.45 * (1.0 - map_scale) + 0.25 * agent_pressure
+        self.pickup_d1_penalty = 0.30 + 0.18 * map_scale + 0.15 * obstacle_density
+        self.pickup_d2_penalty = 0.09 + 0.08 * map_scale + 0.06 * obstacle_density
+        self.pickup_late_penalty = 0.38 + 0.36 * map_scale + 0.12 * agent_pressure
+        self.pickup_density_base = 0.55 + 0.20 * map_scale + 0.20 * obstacle_density
+        self.carry_pick_threshold = 14.0 + 18.0 * map_scale + 8.0 * obstacle_density
+
+    def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
+        return sum(orders[oid].w for oid in shipper.bag if oid in orders)
+
+    def _can_take(self, shipper: Shipper, order: Order, orders: Dict[int, Order]) -> bool:
+        if order.picked or order.delivered or len(shipper.bag) >= shipper.K_max:
+            return False
+        if self._carried_weight(shipper, orders) + order.w > shipper.W_max:
+            return False
+        pickup = (order.sx, order.sy)
+        drop = (order.ex, order.ey)
+        return self.bfs.dist(shipper.position, pickup) < INF and self.bfs.dist(pickup, drop) < INF
+
+    def _can_finish_before_end(self, shipper: Shipper, order: Order, now: int) -> bool:
+        pickup = (order.sx, order.sy)
+        drop = (order.ex, order.ey)
+        d1 = self.bfs.dist(shipper.position, pickup)
+        d2 = self.bfs.dist(pickup, drop)
+        if d1 >= INF or d2 >= INF:
+            return False
+        remaining = self.T - now
+        margin = max(1, min(6, remaining // 12))
+        return d1 + d2 + margin <= remaining
+
+    def _carried(self, shipper: Shipper, orders: Dict[int, Order]) -> List[Order]:
+        return [orders[oid] for oid in shipper.bag if oid in orders and not orders[oid].delivered]
+
+    def _deliverable(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> bool:
+        return any((o.ex, o.ey) == pos for o in self._carried(shipper, orders))
+
+    def _pickup_at(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> Optional[Order]:
+        candidates = [o for o in orders.values() if (o.sx, o.sy) == pos and self._can_take(shipper, o, orders)]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda o: (-o.p, o.et, o.id))
+
+    def _delivery_target(self, shipper: Shipper, orders: Dict[int, Order], now: int) -> Optional[Order]:
+        carried = [
+            order
+            for order in self._carried(shipper, orders)
+            if self.bfs.dist(shipper.position, (order.ex, order.ey)) < INF
+        ]
+        if not carried:
+            return None
+        return min(
+            carried,
+            key=lambda o: (
+                self.bfs.dist(shipper.position, (o.ex, o.ey)),
+                o.et,
+                -o.p,
+                o.id,
+            ),
+        )
+
+    def _pickup_score(self, shipper: Shipper, order: Order, orders: Dict[int, Order], now: int) -> float:
+        pickup = (order.sx, order.sy)
+        drop = (order.ex, order.ey)
+        d1 = self.bfs.dist(shipper.position, pickup)
+        d2 = self.bfs.dist(pickup, drop)
+        if d1 >= INF or d2 >= INF:
+            return -INF
+        finish = now + d1 + d2
+        reward = delivery_reward(order, finish, self.T)
+        late = max(0, finish - order.et)
+        density = 0.0
+        for other in orders.values():
+            if not other.picked and abs(other.sx - order.sx) + abs(other.sy - order.sy) <= 3:
+                density += self.pickup_density_base + 0.2 * other.p
+        return (
+            reward
+            + self.pickup_priority_bonus * order.p
+            + density
+            - self.pickup_d1_penalty * d1
+            - self.pickup_d2_penalty * d2
+            - self.pickup_late_penalty * late
+        )
+
+    def _safe_pickup_while_carrying(self, shipper: Shipper, order: Order, orders: Dict[int, Order], now: int) -> bool:
+        carried = self._carried(shipper, orders)
+        if not carried:
+            return True
+        pickup = (order.sx, order.sy)
+        to_pickup = self.bfs.dist(shipper.position, pickup)
+        if to_pickup >= INF:
+            return False
+
+        direct_slacks = []
+        detour_slacks = []
+        extra_costs = []
+        for carried_order in carried:
+            drop = (carried_order.ex, carried_order.ey)
+            direct = self.bfs.dist(shipper.position, drop)
+            via_pickup = to_pickup + self.bfs.dist(pickup, drop)
+            if direct >= INF or via_pickup >= INF:
+                return False
+            direct_slacks.append(carried_order.et - (now + direct))
+            detour_slacks.append(carried_order.et - (now + via_pickup))
+            extra_costs.append(max(0, via_pickup - direct))
+
+        worst_direct_slack = min(direct_slacks)
+        worst_detour_slack = min(detour_slacks)
+        extra = max(extra_costs)
+        urgency_margin = max(1.0, 0.30 * max(0.0, worst_direct_slack) + 1.5 * order.p)
+        score_after_risk = (
+            self._pickup_score(shipper, order, orders, now)
+            - 1.6 * extra
+            - 5.0 * max(0.0, -worst_detour_slack)
+            - 0.8 * max(0.0, 4.0 - worst_detour_slack)
+        )
+        return extra <= urgency_margin and score_after_risk >= self.carry_pick_threshold
+
+    def _pickup_target(self, shipper: Shipper, orders: Dict[int, Order], now: int, reserved: set[int]) -> Optional[Order]:
+        rough = []
+        for order in orders.values():
+            if order.id in reserved or not self._can_take(shipper, order, orders):
+                continue
+            if not self._can_finish_before_end(shipper, order, now):
+                continue
+            d = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
+            rough.append((4.0 * order.p - 0.25 * d - 0.02 * max(0, order.et - now), order))
+        rough.sort(key=lambda item: (-item[0], item[1].et, item[1].id))
+        limit = max(12, min(36, 10 + 5 * self.C + len(orders) // 8))
+        candidates = []
+        for _, order in rough[:limit]:
+            score = self._pickup_score(shipper, order, orders, now)
+            if score > 0:
+                candidates.append((score, order))
+        if not candidates:
+            return None
+        if self.C < 5 and self.has_inner_obstacles:
+            return min(
+                (item[1] for item in candidates),
+                key=lambda o: (
+                    self.bfs.dist(shipper.position, (o.sx, o.sy)),
+                    -o.p,
+                    o.et,
+                    o.id,
+                ),
+            )
+        return max(
+            candidates,
+            key=lambda o: (
+                o[0],
+                -self.bfs.dist(shipper.position, (o[1].sx, o[1].sy)),
+                o[1].p,
+                -o[1].et,
+                -o[1].id,
+            ),
+        )[1]
+
+    def _action_to(self, shipper: Shipper, goal: Position, op_if_arrive: int, orders: Dict[int, Order]) -> Action:
+        move = self.bfs.next_move(shipper.position, goal)
+        nxt = self.bfs.after(shipper.position, move)
+        op = op_if_arrive if nxt == goal else 0
+        if op == 2 and not self._deliverable(shipper, orders, nxt):
+            op = 0
+        if op == 1 and self._pickup_at(shipper, orders, nxt) is None:
+            op = 0
+        return move, op
+
+    def _avoid_collisions(
+        self,
+        obs: dict,
+        actions: Dict[int, Action],
+        target_positions: Optional[Dict[int, Position]] = None,
+    ) -> Dict[int, Action]:
+        return resolve_collisions_and_blocks(
+            list(obs["shippers"]),
+            actions,
+            self.grid,
+            obs["orders"],
+            self._pickup_at,
+            self._deliverable,
+            target_positions,
+            self.bfs.dist,
+            allow_unblock=self.has_inner_obstacles or self.C >= 3,
+        )
+
+    def _decide(self, obs: dict) -> Dict[int, Action]:
+        orders: Dict[int, Order] = obs["orders"]
+        now = int(obs["t"])
+        actions: Dict[int, Action] = {}
+        target_positions: Dict[int, Position] = {}
+        reserved: set[int] = set()
+        for shipper in sorted(obs["shippers"], key=lambda s: s.id):
+            if self._deliverable(shipper, orders, shipper.position):
+                actions[shipper.id] = ("S", 2)
+                continue
+            here = self._pickup_at(shipper, orders, shipper.position)
+            if here is not None and self._safe_pickup_while_carrying(shipper, here, orders, now):
+                actions[shipper.id] = ("S", 1)
+                reserved.add(here.id)
+                continue
+            delivery = self._delivery_target(shipper, orders, now)
+            if delivery is not None:
+                target_positions[shipper.id] = (delivery.ex, delivery.ey)
+                actions[shipper.id] = self._action_to(shipper, (delivery.ex, delivery.ey), 2, orders)
+                continue
+            pickup = self._pickup_target(shipper, orders, now, reserved)
+            if pickup is not None:
+                reserved.add(pickup.id)
+                target_positions[shipper.id] = (pickup.sx, pickup.sy)
+                actions[shipper.id] = self._action_to(shipper, (pickup.sx, pickup.sy), 1, orders)
+            else:
+                actions[shipper.id] = ("S", 0)
+        return self._avoid_collisions(obs, actions, target_positions)
+
+    def run(self) -> dict:
+        start = time.time()
+        obs = self.env.reset()
+        self._configure_by_observation(int(obs["N"]), int(obs["C"]), int(obs["T"]), obs["grid"])
+        self.run_deadline = start + max(20.0, min(80.0, 0.08 * self.T + 6.0 * self.C))
+        while not obs.get("done", False):
+            if time.time() > self.run_deadline:
+                actions = {s.id: ("S", 2) for s in obs["shippers"]}
+            else:
+                actions = self._decide(obs)
+            obs, _, done, _ = self.env.step(actions)
+            if done:
+                break
+        return self.env.result(self.method_name, time.time() - start)

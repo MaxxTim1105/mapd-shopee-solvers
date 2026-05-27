@@ -143,6 +143,26 @@ class ACOSolver(Solver):
     def _deliverable(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> bool:
         return any((o.ex, o.ey) == pos for o in self._carried(shipper, orders))
 
+    def _safe_pickup_while_carrying(self, shipper: Shipper, order: Order, orders: Dict[int, Order], now: int) -> bool:
+        carried = self._carried(shipper, orders)
+        if not carried:
+            return True
+        pickup = (order.sx, order.sy)
+        to_pickup = self.bfs.dist(shipper.position, pickup)
+        if to_pickup >= INF:
+            return False
+        for o in carried:
+            direct = self.bfs.dist(shipper.position, (o.ex, o.ey))
+            via = to_pickup + self.bfs.dist(pickup, (o.ex, o.ey))
+            if via >= INF:
+                return False
+            extra = via - direct if direct < INF else via
+            if extra > max(6, self.N // 2):
+                return False
+            if o.et - (now + via) < -5:
+                return False
+        return True
+
     def _pickup_at(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> Optional[Order]:
         candidates = [o for o in orders.values() if (o.sx, o.sy) == pos and self._can_take(shipper, o, orders)]
         if not candidates:
@@ -222,9 +242,57 @@ class ACOSolver(Solver):
         for shipper in shuffled:
             if shipper.bag:
                 delivery = self._delivery_target(shipper, orders, now)
+                deliver_value = -INF
                 if delivery is not None:
+                    dist_to_delivery = self.bfs.dist(shipper.position, (delivery.ex, delivery.ey))
+                    if dist_to_delivery < INF:
+                        deliver_value = delivery_reward(delivery, now + dist_to_delivery, self.T)
+
+                best_pickup = None
+                best_pickup_value = -INF
+                if len(shipper.bag) < shipper.K_max:
+                    for order in self._candidate_pool(shipper, orders, now):
+                        if order.id in used:
+                            continue
+                        pickup = (order.sx, order.sy)
+                        drop = (order.ex, order.ey)
+
+                        extra_dist = 0
+                        can_evaluate = True
+                        for oid in shipper.bag:
+                            o = orders.get(oid)
+                            if o and not o.delivered:
+                                d_via = self.bfs.dist(shipper.position, pickup) + self.bfs.dist(pickup, (o.ex, o.ey))
+                                if d_via >= INF:
+                                    can_evaluate = False
+                                    break
+                                d_direct = self.bfs.dist(shipper.position, (o.ex, o.ey))
+                                if d_direct < INF:
+                                    extra_dist = max(extra_dist, d_via - d_direct)
+                        if not can_evaluate or extra_dist > max(8, self.N):
+                            continue
+
+                        pher = self.pheromone[(pickup, drop)]
+                        h = self._heuristic(shipper, order, orders, now)
+                        finish = now + self.bfs.dist(shipper.position, pickup) + self.bfs.dist(pickup, drop)
+                        lateness = max(0, finish - order.et)
+                        feasibility = 1.0 / (1.0 + 0.75 * lateness)
+                        value = (pher ** 1.2) * (h ** 2.0) * feasibility - 0.6 * extra_dist
+                        if value > best_pickup_value:
+                            best_pickup_value = value
+                            best_pickup = order
+
+                if best_pickup is not None and self._safe_pickup_while_carrying(shipper, best_pickup, orders, now) and (delivery is None or best_pickup_value > deliver_value * 1.2):
+                    order = best_pickup
+                    used.add(order.id)
+                    pickup = (order.sx, order.sy)
+                    drop = (order.ex, order.ey)
+                    targets[shipper.id] = ("pickup", order.id, pickup)
+                    edges.append((pickup, drop))
+                    total += self._heuristic(shipper, order, orders, now)
+                elif delivery is not None:
                     targets[shipper.id] = ("deliver", delivery.id, (delivery.ex, delivery.ey))
-                    total += delivery_reward(delivery, now + self.bfs.dist(shipper.position, (delivery.ex, delivery.ey)), self.T)
+                    total += deliver_value
                 continue
             candidates = []
             weights = []
@@ -318,7 +386,7 @@ class ACOSolver(Solver):
                 actions[shipper.id] = ("S", 2)
                 continue
             here = self._pickup_at(shipper, orders, shipper.position)
-            if here is not None and not shipper.bag:
+            if here is not None and (not shipper.bag or self._safe_pickup_while_carrying(shipper, here, orders, now)):
                 actions[shipper.id] = ("S", 1)
                 continue
             target = targets.get(shipper.id)

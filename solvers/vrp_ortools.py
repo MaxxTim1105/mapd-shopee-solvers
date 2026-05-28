@@ -178,9 +178,12 @@ class VRPOrToolsSolver(Solver):
         return reward + 3.5 * order.p + self._visible_pickup_density(order, orders) + urgency - 0.28 * d1 - 0.10 * d2 - 0.85 * late
 
     def _candidate_pool(self, shipper: Shipper, orders: Dict[int, Order], now: int, limit: int = 34) -> List[Order]:
+        max_dist = 22 if self.N > 30 else 15
         if self.asd < 16.0:
             scored = []
             for order in orders.values():
+                if abs(shipper.r - order.sx) + abs(shipper.c - order.sy) > max_dist:
+                    continue
                 if not self._can_take(shipper, order, orders):
                     continue
                 d1 = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
@@ -199,6 +202,8 @@ class VRPOrToolsSolver(Solver):
 
         rough = []
         for order in orders.values():
+            if abs(shipper.r - order.sx) + abs(shipper.c - order.sy) > max_dist:
+                continue
             if not self._can_take(shipper, order, orders):
                 continue
             d1 = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
@@ -475,7 +480,11 @@ class VRPOrToolsSolver(Solver):
         self.run_deadline = start + max(20.0, min(90.0, 0.10 * self.T + 8.0 * self.C))
         while not obs.get("done", False):
             if time.time() > self.run_deadline:
-                actions = {s.id: ("S", 2) for s in obs["shippers"]}
+                if not hasattr(self, "fallback_solver") or self.fallback_solver is None:
+                    from solvers.greedy_bfs import GreedyBFS
+                    self.fallback_solver = GreedyBFS(self.env)
+                    self.fallback_solver._configure_by_observation(self.N, self.C, self.T, self.grid)
+                actions = self.fallback_solver._decide(obs)
             else:
                 actions = self._decide(obs)
             obs, _, done, _ = self.env.step(actions)

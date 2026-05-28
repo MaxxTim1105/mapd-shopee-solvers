@@ -203,8 +203,13 @@ class GreedyBFS(Solver):
 
     def _pickup_target(self, shipper: Shipper, orders: Dict[int, Order], now: int, reserved: set[int]) -> Optional[Order]:
         rough = []
+        max_dist = 22 if self.N > 30 else 15
         for order in orders.values():
-            if order.id in reserved or not self._can_take(shipper, order, orders):
+            if order.id in reserved:
+                continue
+            if abs(shipper.r - order.sx) + abs(shipper.c - order.sy) > max_dist:
+                continue
+            if not self._can_take(shipper, order, orders):
                 continue
             d = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
             rough.append((4.0 * order.p - 0.25 * d - 0.02 * max(0, order.et - now), order))

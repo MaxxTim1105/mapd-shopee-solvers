@@ -181,7 +181,13 @@ def find_best_detour_target(
     empty_shippers = [s for s in shippers if not s.bag and s.id != shipper.id]
     
     for order in orders.values():
-        if order.id in reserved or not can_take_fn(shipper, order, orders):
+        if order.id in reserved:
+            continue
+        # Fast Manhattan distance pruning: detours further than 18 steps are highly inefficient
+        man_dist = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
+        if man_dist > 18:
+            continue
+        if not can_take_fn(shipper, order, orders):
             continue
             
         pickup_pos = (order.sx, order.sy)

@@ -142,17 +142,6 @@ class VRPOrToolsSolver(Solver):
         drop = (order.ex, order.ey)
         return self.bfs.dist(shipper.position, pickup) < INF and self.bfs.dist(pickup, drop) < INF
 
-    def _can_finish_before_end(self, shipper: Shipper, order: Order, now: int) -> bool:
-        pickup = (order.sx, order.sy)
-        drop = (order.ex, order.ey)
-        d1 = self.bfs.dist(shipper.position, pickup)
-        d2 = self.bfs.dist(pickup, drop)
-        if d1 >= INF or d2 >= INF:
-            return False
-        remaining = self.T - now
-        margin = max(1, min(7, remaining // 14))
-        return d1 + d2 + margin <= remaining
-
     def _deliverable(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> bool:
         return any((o.ex, o.ey) == pos for o in self._carried(shipper, orders))
 
@@ -217,8 +206,6 @@ class VRPOrToolsSolver(Solver):
                 continue
             if not self._can_take(shipper, order, orders):
                 continue
-            if not self._can_finish_before_end(shipper, order, now):
-                continue
             d1 = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
             d2 = abs(order.sx - order.ex) + abs(order.sy - order.ey)
             finish = now + d1 + d2
@@ -261,9 +248,7 @@ class VRPOrToolsSolver(Solver):
             elif kind == "deliver" and oid in carried:
                 reward = delivery_reward(order, t, self.T)
                 late = max(0, t - order.et)
-                slack = order.et - t
-                low_slack_penalty = max(0.0, 4.0 - slack) * (0.05 + 0.03 * order.p)
-                value += reward - self.late_penalty * late - low_slack_penalty
+                value += reward - self.late_penalty * late
                 if oid in picked:
                     value += 1.0
                     if self.asd >= 16.0:
@@ -278,52 +263,6 @@ class VRPOrToolsSolver(Solver):
                 load -= order.w
                 carried.remove(oid)
         return value
-
-    def _carried_detour_risk(
-        self,
-        shipper: Shipper,
-        route: Sequence[Stop],
-        candidate: Sequence[Stop],
-        orders: Dict[int, Order],
-        now: int,
-    ) -> float:
-        carried_ids = set(shipper.bag)
-        if not carried_ids:
-            return 0.0
-
-        def finish_times(path: Sequence[Stop]) -> Dict[int, int]:
-            pos = shipper.position
-            t = now
-            result: Dict[int, int] = {}
-            for kind, oid, target in path:
-                d = self.bfs.dist(pos, target)
-                if d >= INF:
-                    return {}
-                t += d
-                pos = target
-                if kind == "deliver" and oid in carried_ids:
-                    result[oid] = t
-            return result
-
-        base_finish = finish_times(route)
-        candidate_finish = finish_times(candidate)
-        if len(candidate_finish) < len(carried_ids):
-            return INF
-        risk = 0.0
-        for oid in carried_ids:
-            order = orders.get(oid)
-            if order is None:
-                continue
-            base_t = base_finish.get(oid, now)
-            cand_t = candidate_finish.get(oid, INF)
-            delay = max(0, cand_t - base_t)
-            slack = order.et - cand_t
-            base_slack = order.et - base_t
-            free_delay = max(0.0, min(4.0 + 0.6 * order.p, 0.35 * max(0, base_slack)))
-            risky_delay = max(0.0, delay - free_delay)
-            deadline_risk = 4.5 * max(0, -slack) + 0.45 * max(0, 2 - slack)
-            risk = max(risk, self.detour_delay_weight * risky_delay + deadline_risk)
-        return risk
 
     def _initial_route(self, shipper: Shipper, orders: Dict[int, Order], now: int) -> List[Stop]:
         carried = self._carried(shipper, orders)
@@ -366,10 +305,7 @@ class VRPOrToolsSolver(Solver):
                 candidate.insert(i, pickup)
                 candidate.insert(j, deliver)
                 score = self._route_score(shipper, candidate, orders, now)
-                risk = self._carried_detour_risk(shipper, route, candidate, orders, now)
-                direct_score = self._completion_score(shipper, order, orders, now)
-                urgency_bonus = max(0.0, min(4.0, direct_score / 35.0))
-                gain = score - base - risk + urgency_bonus
+                gain = score - base
                 if gain > best_gain:
                     best_gain = gain
                     best_route = candidate
@@ -384,7 +320,6 @@ class VRPOrToolsSolver(Solver):
             if self.run_deadline and time.time() > self.run_deadline:
                 break
             best = None
-            feasible: List[Tuple[float, Shipper, Order, List[Stop]]] = []
             for shipper in sorted(shippers, key=lambda s: s.id):
                 if capacity_slots[shipper.id] <= 0:
                     continue
@@ -397,19 +332,7 @@ class VRPOrToolsSolver(Solver):
                     gain, new_route = self._best_insertion(shipper, routes[shipper.id], order, orders, now)
                     if new_route is None or gain <= 0:
                         continue
-                    feasible.append((gain, shipper, order, new_route))
-            if feasible:
-                top_gain = max(item[0] for item in feasible)
-                gains_by_order: Dict[int, List[float]] = {}
-                for gain, _, order, _ in feasible:
-                    gains_by_order.setdefault(order.id, []).append(gain)
-                for gain, shipper, order, new_route in feasible:
-                    order_gains = sorted(gains_by_order[order.id], reverse=True)
-                    second = order_gains[1] if len(order_gains) > 1 else 0.0
-                    regret = max(0.0, gain - second)
-                    near_best = max(0.0, top_gain - gain)
-                    regret_tiebreak = 0.18 * regret if near_best <= max(1.5, 0.08 * abs(top_gain)) else 0.0
-                    key = (gain + regret_tiebreak, gain, order.p, -order.et, -order.id)
+                    key = (gain, order.p, -order.et, -order.id)
                     if best is None or key > best[0]:
                         best = (key, shipper.id, order.id, new_route)
             if best is None:
@@ -545,10 +468,9 @@ class VRPOrToolsSolver(Solver):
             routes = self._build_vrp_routes(active, orders, now)
         self.route_plan = routes
         for shipper in active:
-            route = routes.get(shipper.id, [])
-            actions[shipper.id] = self._first_action(shipper, route, orders)
-            if route:
-                target_positions[shipper.id] = route[0][2]
+            actions[shipper.id] = self._first_action(shipper, routes.get(shipper.id, []), orders)
+            if routes.get(shipper.id):
+                target_positions[shipper.id] = routes[shipper.id][0][2]
         return self._avoid_collisions(obs, actions, target_positions)
 
     def run(self) -> dict:

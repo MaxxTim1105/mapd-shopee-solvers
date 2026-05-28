@@ -145,17 +145,6 @@ class ACOSolver(Solver):
         drop = (order.ex, order.ey)
         return self.bfs.dist(shipper.position, pickup) < INF and self.bfs.dist(pickup, drop) < INF
 
-    def _can_finish_before_end(self, shipper: Shipper, order: Order, now: int) -> bool:
-        pickup = (order.sx, order.sy)
-        drop = (order.ex, order.ey)
-        d1 = self.bfs.dist(shipper.position, pickup)
-        d2 = self.bfs.dist(pickup, drop)
-        if d1 >= INF or d2 >= INF:
-            return False
-        remaining = self.T - now
-        margin = max(1, min(6, remaining // 14))
-        return d1 + d2 + margin <= remaining
-
     def _deliverable(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> bool:
         return any((o.ex, o.ey) == pos for o in self._carried(shipper, orders))
 
@@ -182,23 +171,18 @@ class ACOSolver(Solver):
         finish = now + d1 + d2
         reward = delivery_reward(order, finish, self.T)
         late = max(0, finish - order.et)
-        slack = order.et - finish
         heat = self.pickup_heat.get(pickup, 0.0)
         cluster = sum(1 for o in orders.values() if not o.picked and abs(o.sx - order.sx) + abs(o.sy - order.sy) <= 3)
-        base = (
+        return max(
+            0.001,
             reward
             + 2.5 * order.p
             + heat
             + cluster
             - self.d1_penalty * d1
             - self.d2_penalty * d2
-            - self.late_penalty * late
+            - self.late_penalty * late,
         )
-        if slack >= 0:
-            base += (0.8 + 0.25 * order.p) / (1.0 + slack / 16.0)
-        else:
-            base /= 1.0 + min(8.0, -slack)
-        return max(0.001, base)
 
     def _candidate_pool(self, shipper: Shipper, orders: Dict[int, Order], now: int, limit: int = 24) -> List[Order]:
         scored = []
@@ -207,8 +191,6 @@ class ACOSolver(Solver):
             if abs(shipper.r - order.sx) + abs(shipper.c - order.sy) > max_dist:
                 continue
             if not self._can_take(shipper, order, orders):
-                continue
-            if not self._can_finish_before_end(shipper, order, now):
                 continue
             h = self._heuristic(shipper, order, orders, now)
             if h > 0.001:
@@ -227,8 +209,7 @@ class ACOSolver(Solver):
         return max(
             carried,
             key=lambda o: delivery_reward(o, now + self.bfs.dist(shipper.position, (o.ex, o.ey)), self.T)
-            + max(0.0, 26.0 - (o.et - now - self.bfs.dist(shipper.position, (o.ex, o.ey)))) * (0.16 + 0.07 * o.p)
-            - 0.22 * self.bfs.dist(shipper.position, (o.ex, o.ey)),
+            - 0.2 * self.bfs.dist(shipper.position, (o.ex, o.ey)),
         )
 
     def _construct_ant(self, shippers: List[Shipper], orders: Dict[int, Order], now: int) -> Tuple[float, Dict[int, Tuple[str, int, Position]], List[Tuple[Position, Position]]]:
@@ -293,10 +274,7 @@ class ACOSolver(Solver):
                 drop = (order.ex, order.ey)
                 pher = self.pheromone[(pickup, drop)]
                 h = self._heuristic(shipper, order, orders, now)
-                finish = now + self.bfs.dist(shipper.position, pickup) + self.bfs.dist(pickup, drop)
-                lateness = max(0, finish - order.et)
-                feasibility = 1.0 / (1.0 + 0.75 * lateness)
-                desirability = (pher ** 1.2) * (h ** 2.0) * feasibility
+                desirability = (pher ** 1.2) * (h ** 2.0)
                 candidates.append(order)
                 weights.append(desirability)
             if not candidates:

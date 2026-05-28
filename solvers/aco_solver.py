@@ -7,7 +7,15 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
 from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.detour_utils import (
+    evaluate_detour_net_reward,
+    find_best_detour_target,
+    is_pickup_safe,
+)
 from solvers.solver import Solver
+
+
+from solvers.heuristic_utils import get_aco_params, estimate_average_shortest_path
 
 
 Move = str
@@ -17,9 +25,11 @@ INF = 10**8
 MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
 
 
+
 class BFS:
     def __init__(self, grid: List[List[int]]):
         self.grid = grid
+        self.sssp_cache: Dict[Position, Dict[Position, int]] = {}
         self.dist_cache: Dict[Tuple[Position, Position], int] = {}
         self.move_cache: Dict[Tuple[Position, Position], Move] = {}
 
@@ -29,31 +39,34 @@ class BFS:
             if nxt != pos:
                 yield move, nxt
 
-    def dist(self, start: Position, goal: Position) -> int:
-        if start == goal:
-            return 0
-        key = (start, goal)
-        if key in self.dist_cache:
-            return self.dist_cache[key]
-        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
-            self.dist_cache[key] = INF
-            return INF
+    def get_all_dists(self, start: Position) -> Dict[Position, int]:
+        if start in self.sssp_cache:
+            return self.sssp_cache[start]
+        if not is_valid_cell(start, self.grid):
+            return {}
         q = deque([start])
         dist = {start: 0}
         while q:
             pos = q.popleft()
+            d = dist[pos]
             for _, nxt in self.neighbors(pos):
-                if nxt in dist:
-                    continue
-                nd = dist[pos] + 1
-                if nxt == goal:
-                    self.dist_cache[key] = nd
-                    self.dist_cache[(goal, start)] = nd
-                    return nd
-                dist[nxt] = nd
-                q.append(nxt)
-        self.dist_cache[key] = INF
-        return INF
+                if nxt not in dist:
+                    dist[nxt] = d + 1
+                    q.append(nxt)
+        self.sssp_cache[start] = dist
+        return dist
+
+    def dist(self, start: Position, goal: Position) -> int:
+        if start == goal:
+            return 0
+        if start in self.sssp_cache:
+            return self.sssp_cache[start].get(goal, INF)
+        if goal in self.sssp_cache:
+            return self.sssp_cache[goal].get(start, INF)
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            return INF
+        dist_map = self.get_all_dists(start)
+        return dist_map.get(goal, INF)
 
     def next_move(self, start: Position, goal: Position) -> Move:
         if start == goal:
@@ -61,20 +74,28 @@ class BFS:
         key = (start, goal)
         if key in self.move_cache:
             return self.move_cache[key]
-        q = deque([start])
-        first = {start: "S"}
-        while q:
-            pos = q.popleft()
-            for move, nxt in self.neighbors(pos):
-                if nxt in first:
-                    continue
-                first[nxt] = move if pos == start else first[pos]
-                if nxt == goal:
-                    self.move_cache[key] = first[nxt]
-                    return first[nxt]
-                q.append(nxt)
-        self.move_cache[key] = "S"
-        return "S"
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            self.move_cache[key] = "S"
+            return "S"
+        
+        dist_map = self.get_all_dists(goal)
+        start_d = dist_map.get(start, INF)
+        if start_d >= INF:
+            self.move_cache[key] = "S"
+            return "S"
+            
+        best_move = "S"
+        best_d = start_d
+        for move in MOVES:
+            nxt = valid_next_pos(start, move, self.grid)
+            if nxt != start:
+                nd = dist_map.get(nxt, INF)
+                if nd < best_d:
+                    best_d = nd
+                    best_move = move
+                    
+        self.move_cache[key] = best_move
+        return best_move
 
     def after(self, pos: Position, move: Move) -> Position:
         return valid_next_pos(pos, move, self.grid)
@@ -105,14 +126,9 @@ class ACOSolver(Solver):
         self.T = t
         self.grid = grid
         self.bfs = BFS(grid)
-        cells = max(1, n * n)
-        blocked = sum(1 for row in grid for cell in row if cell != 0)
-        obstacle_density = blocked / cells
-        map_scale = min(1.0, max(0.0, (n - 6) / max(1.0, n + 6)))
-        agent_pressure = min(1.0, c / max(1.0, n))
-        self.d1_penalty = 0.20 + 0.48 * map_scale + 0.18 * obstacle_density + 0.10 * agent_pressure
-        self.d2_penalty = 0.06 + 0.13 * map_scale + 0.08 * obstacle_density
-        self.late_penalty = 0.50 + 0.72 * map_scale + 0.25 * obstacle_density + 0.12 * agent_pressure
+        self.shipper_commitments: Dict[int, int] = {}
+        self.asd = estimate_average_shortest_path(grid, self.bfs)
+        self.d1_penalty, self.d2_penalty, self.late_penalty = get_aco_params(n, c, t, grid, self.bfs)
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -186,7 +202,10 @@ class ACOSolver(Solver):
 
     def _candidate_pool(self, shipper: Shipper, orders: Dict[int, Order], now: int, limit: int = 24) -> List[Order]:
         scored = []
+        max_dist = 22 if self.N > 30 else 15
         for order in orders.values():
+            if abs(shipper.r - order.sx) + abs(shipper.c - order.sy) > max_dist:
+                continue
             if not self._can_take(shipper, order, orders):
                 continue
             if not self._can_finish_before_end(shipper, order, now):
@@ -221,10 +240,49 @@ class ACOSolver(Solver):
         self.rng.shuffle(shuffled)
         for shipper in shuffled:
             if shipper.bag:
-                delivery = self._delivery_target(shipper, orders, now)
-                if delivery is not None:
-                    targets[shipper.id] = ("deliver", delivery.id, (delivery.ex, delivery.ey))
-                    total += delivery_reward(delivery, now + self.bfs.dist(shipper.position, (delivery.ex, delivery.ey)), self.T)
+                # 1. Kiểm tra cam kết đi vòng hiện tại trước
+                committed_order = None
+                if shipper.id in self.shipper_commitments:
+                    committed_oid = self.shipper_commitments[shipper.id]
+                    if committed_oid in orders:
+                        committed_order = orders[committed_oid]
+                
+                if committed_order is not None:
+                    pickup_pos = (committed_order.sx, committed_order.sy)
+                    if is_pickup_safe(shipper, committed_order, orders, now, pickup_pos, self.bfs.dist):
+                        targets[shipper.id] = ("pickup", committed_order.id, pickup_pos)
+                        used.add(committed_order.id)
+                        pickup = pickup_pos
+                        drop = (committed_order.ex, committed_order.ey)
+                        edges.append((pickup, drop))
+                        total += self._heuristic(shipper, committed_order, orders, now)
+                        continue
+                
+                # 2. Nếu không có cam kết hoặc cam kết không an toàn, tìm đường vòng mới hoặc đi giao hàng
+                detour_allowed = self.asd < 7.2 or self.T >= 700
+                can_pickup_more = (
+                    detour_allowed
+                    and len(shipper.bag) < shipper.K_max
+                    and self._carried_weight(shipper, orders) < shipper.W_max
+                )
+                detour = None
+                if can_pickup_more:
+                    detour = find_best_detour_target(
+                        shipper, orders, now, used, shuffled, self.bfs.dist, self.T, self._can_take
+                    )
+                
+                if detour is not None:
+                    targets[shipper.id] = ("pickup", detour.id, (detour.sx, detour.sy))
+                    used.add(detour.id)
+                    pickup = (detour.sx, detour.sy)
+                    drop = (detour.ex, detour.ey)
+                    edges.append((pickup, drop))
+                    total += self._heuristic(shipper, detour, orders, now)
+                else:
+                    delivery = self._delivery_target(shipper, orders, now)
+                    if delivery is not None:
+                        targets[shipper.id] = ("deliver", delivery.id, (delivery.ex, delivery.ey))
+                        total += delivery_reward(delivery, now + self.bfs.dist(shipper.position, (delivery.ex, delivery.ey)), self.T)
                 continue
             candidates = []
             weights = []
@@ -259,7 +317,7 @@ class ACOSolver(Solver):
         best_targets: Dict[int, Tuple[str, int, Position]] = {}
         best_edges: List[Tuple[Position, Position]] = []
         ants = max(8, min(18, 3 * max(1, len(shippers))))
-        iterations = max(2, min(4, 1 + len(shippers) // 3 + (1 if len(orders) <= max(6, 3 * len(shippers)) else 0)))
+        iterations = 3 if self.asd <= 6.0 else 2
         for _ in range(iterations):
             for _ in range(ants):
                 if self.run_deadline and time.time() > self.run_deadline:
@@ -311,15 +369,45 @@ class ACOSolver(Solver):
         orders: Dict[int, Order] = obs["orders"]
         shippers: List[Shipper] = list(obs["shippers"])
         now = int(obs["t"])
+        
+        # Clean up invalid/completed commitments
+        for sid in list(self.shipper_commitments.keys()):
+            oid = self.shipper_commitments[sid]
+            if oid not in orders or orders[oid].picked or orders[oid].delivered:
+                del self.shipper_commitments[sid]
+                
         targets = self._aco_targets(shippers, orders, now)
+        
+        # Save commitments for carrying shippers
+        for shipper in shippers:
+            if shipper.bag:
+                target = targets.get(shipper.id)
+                if target is not None and target[0] == "pickup":
+                    self.shipper_commitments[shipper.id] = target[1]
+                else:
+                    self.shipper_commitments.pop(shipper.id, None)
+                    
         actions: Dict[int, Action] = {}
         for shipper in shippers:
             if self._deliverable(shipper, orders, shipper.position):
                 actions[shipper.id] = ("S", 2)
+                self.shipper_commitments.pop(shipper.id, None)
                 continue
             here = self._pickup_at(shipper, orders, shipper.position)
-            if here is not None and not shipper.bag:
+            detour_allowed = self.asd < 7.2 or self.T >= 700
+            if not detour_allowed:
+                pickup_allowed = here is not None and not shipper.bag
+            else:
+                pickup_allowed = here is not None and (
+                    not shipper.bag
+                    or (
+                        is_pickup_safe(shipper, here, orders, now, shipper.position, self.bfs.dist)
+                        and evaluate_detour_net_reward(shipper, here, orders, now, self.bfs.dist, self.T) > 0.0
+                    )
+                )
+            if pickup_allowed:
                 actions[shipper.id] = ("S", 1)
+                self.shipper_commitments.pop(shipper.id, None)
                 continue
             target = targets.get(shipper.id)
             if target is None:
@@ -336,7 +424,11 @@ class ACOSolver(Solver):
         self.run_deadline = start + max(20.0, min(110.0, 0.12 * self.T + 9.0 * self.C))
         while not obs.get("done", False):
             if time.time() > self.run_deadline:
-                actions = {s.id: ("S", 2) for s in obs["shippers"]}
+                if not hasattr(self, "fallback_solver") or self.fallback_solver is None:
+                    from solvers.greedy_bfs import GreedyBFS
+                    self.fallback_solver = GreedyBFS(self.env)
+                    self.fallback_solver._configure_by_observation(self.N, self.C, self.T, self.grid)
+                actions = self.fallback_solver._decide(obs)
             else:
                 actions = self._decide(obs)
             obs, _, done, _ = self.env.step(actions)

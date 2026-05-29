@@ -6,7 +6,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, is_valid_cell, valid_next_pos
 from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.detour_utils import (
+    evaluate_detour_net_reward,
+    is_pickup_safe,
+)
 from solvers.solver import Solver
+from solvers.heuristic_utils import get_vrp_params, estimate_average_shortest_path
+
 
 
 Move = str
@@ -20,6 +26,7 @@ MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
 class BFS:
     def __init__(self, grid: List[List[int]]):
         self.grid = grid
+        self.sssp_cache: Dict[Position, Dict[Position, int]] = {}
         self.dist_cache: Dict[Tuple[Position, Position], int] = {}
         self.move_cache: Dict[Tuple[Position, Position], Move] = {}
 
@@ -29,31 +36,34 @@ class BFS:
             if nxt != pos:
                 yield move, nxt
 
-    def dist(self, start: Position, goal: Position) -> int:
-        if start == goal:
-            return 0
-        key = (start, goal)
-        if key in self.dist_cache:
-            return self.dist_cache[key]
-        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
-            self.dist_cache[key] = INF
-            return INF
+    def get_all_dists(self, start: Position) -> Dict[Position, int]:
+        if start in self.sssp_cache:
+            return self.sssp_cache[start]
+        if not is_valid_cell(start, self.grid):
+            return {}
         q = deque([start])
         dist = {start: 0}
         while q:
             pos = q.popleft()
+            d = dist[pos]
             for _, nxt in self.neighbors(pos):
-                if nxt in dist:
-                    continue
-                nd = dist[pos] + 1
-                if nxt == goal:
-                    self.dist_cache[key] = nd
-                    self.dist_cache[(goal, start)] = nd
-                    return nd
-                dist[nxt] = nd
-                q.append(nxt)
-        self.dist_cache[key] = INF
-        return INF
+                if nxt not in dist:
+                    dist[nxt] = d + 1
+                    q.append(nxt)
+        self.sssp_cache[start] = dist
+        return dist
+
+    def dist(self, start: Position, goal: Position) -> int:
+        if start == goal:
+            return 0
+        if start in self.sssp_cache:
+            return self.sssp_cache[start].get(goal, INF)
+        if goal in self.sssp_cache:
+            return self.sssp_cache[goal].get(start, INF)
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            return INF
+        dist_map = self.get_all_dists(start)
+        return dist_map.get(goal, INF)
 
     def next_move(self, start: Position, goal: Position) -> Move:
         if start == goal:
@@ -61,20 +71,28 @@ class BFS:
         key = (start, goal)
         if key in self.move_cache:
             return self.move_cache[key]
-        q = deque([start])
-        first = {start: "S"}
-        while q:
-            pos = q.popleft()
-            for move, nxt in self.neighbors(pos):
-                if nxt in first:
-                    continue
-                first[nxt] = move if pos == start else first[pos]
-                if nxt == goal:
-                    self.move_cache[key] = first[nxt]
-                    return first[nxt]
-                q.append(nxt)
-        self.move_cache[key] = "S"
-        return "S"
+        if not is_valid_cell(start, self.grid) or not is_valid_cell(goal, self.grid):
+            self.move_cache[key] = "S"
+            return "S"
+        
+        dist_map = self.get_all_dists(goal)
+        start_d = dist_map.get(start, INF)
+        if start_d >= INF:
+            self.move_cache[key] = "S"
+            return "S"
+            
+        best_move = "S"
+        best_d = start_d
+        for move in MOVES:
+            nxt = valid_next_pos(start, move, self.grid)
+            if nxt != start:
+                nd = dist_map.get(nxt, INF)
+                if nd < best_d:
+                    best_d = nd
+                    best_move = move
+                    
+        self.move_cache[key] = best_move
+        return best_move
 
     def after(self, pos: Position, move: Move) -> Position:
         return valid_next_pos(pos, move, self.grid)
@@ -106,20 +124,8 @@ class VRPOrToolsSolver(Solver):
         self.T = t
         self.grid = grid
         self.bfs = BFS(grid)
-        cells = max(1, n * n)
-        blocked = sum(1 for row in grid for cell in row if cell != 0)
-        obstacle_density = blocked / cells
-        map_scale = min(1.0, max(0.0, (n - 6) / max(1.0, n + 6)))
-        agent_pressure = min(1.0, c / max(1.0, n))
-        low_agent_relief = max(0.0, (3.0 - c) / 3.0)
-        self.travel_penalty = max(
-            0.012,
-            0.030 + 0.105 * map_scale + 0.08 * obstacle_density + 0.03 * agent_pressure - 0.035 * low_agent_relief,
-        )
-        self.late_penalty = 0.22 + 0.28 * map_scale + 0.16 * obstacle_density + 0.08 * agent_pressure
-        self.route_density_weight = 0.05 + 0.12 * map_scale + 0.08 * obstacle_density
-        self.same_destination_weight = 0.35 + 0.45 * map_scale + 0.20 * agent_pressure
-        self.detour_delay_weight = 0.35 + 0.25 * obstacle_density + 0.15 * agent_pressure
+        self.asd = estimate_average_shortest_path(grid, self.bfs)
+        self.travel_penalty, self.late_penalty = get_vrp_params(n, c, t, grid, self.bfs)
 
     def _carried_weight(self, shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -135,17 +141,6 @@ class VRPOrToolsSolver(Solver):
         pickup = (order.sx, order.sy)
         drop = (order.ex, order.ey)
         return self.bfs.dist(shipper.position, pickup) < INF and self.bfs.dist(pickup, drop) < INF
-
-    def _can_finish_before_end(self, shipper: Shipper, order: Order, now: int) -> bool:
-        pickup = (order.sx, order.sy)
-        drop = (order.ex, order.ey)
-        d1 = self.bfs.dist(shipper.position, pickup)
-        d2 = self.bfs.dist(pickup, drop)
-        if d1 >= INF or d2 >= INF:
-            return False
-        remaining = self.T - now
-        margin = max(1, min(7, remaining // 14))
-        return d1 + d2 + margin <= remaining
 
     def _deliverable(self, shipper: Shipper, orders: Dict[int, Order], pos: Position) -> bool:
         return any((o.ex, o.ey) == pos for o in self._carried(shipper, orders))
@@ -183,11 +178,33 @@ class VRPOrToolsSolver(Solver):
         return reward + 3.5 * order.p + self._visible_pickup_density(order, orders) + urgency - 0.28 * d1 - 0.10 * d2 - 0.85 * late
 
     def _candidate_pool(self, shipper: Shipper, orders: Dict[int, Order], now: int, limit: int = 34) -> List[Order]:
+        max_dist = 22 if self.N > 30 else 15
+        if self.asd < 16.0:
+            scored = []
+            for order in orders.values():
+                if abs(shipper.r - order.sx) + abs(shipper.c - order.sy) > max_dist:
+                    continue
+                if not self._can_take(shipper, order, orders):
+                    continue
+                d1 = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
+                d2 = abs(order.sx - order.ex) + abs(order.sy - order.ey)
+                finish = now + d1 + d2
+                late = max(0, finish - order.et)
+                density = sum(
+                    1
+                    for other in orders.values()
+                    if not other.picked and abs(other.sx - order.sx) + abs(other.sy - order.sy) <= 4
+                )
+                rough_score = delivery_reward(order, finish, self.T) + 1.8 * density + 4.0 * order.p - 0.35 * d1 - late
+                scored.append((rough_score, order.et, order.id, order))
+            scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+            return [item[3] for item in scored[:limit]]
+
         rough = []
         for order in orders.values():
-            if not self._can_take(shipper, order, orders):
+            if abs(shipper.r - order.sx) + abs(shipper.c - order.sy) > max_dist:
                 continue
-            if not self._can_finish_before_end(shipper, order, now):
+            if not self._can_take(shipper, order, orders):
                 continue
             d1 = abs(shipper.r - order.sx) + abs(shipper.c - order.sy)
             d2 = abs(order.sx - order.ex) + abs(order.sy - order.ey)
@@ -223,7 +240,7 @@ class VRPOrToolsSolver(Solver):
                 continue
             if kind == "pickup":
                 if oid not in carried:
-                    if len(carried) >= shipper.K_max or load + order.w > shipper.W_max:
+                    if self.asd >= 16.0 and (len(carried) >= shipper.K_max or load + order.w > shipper.W_max):
                         return -INF
                     load += order.w
                     carried.add(oid)
@@ -231,67 +248,21 @@ class VRPOrToolsSolver(Solver):
             elif kind == "deliver" and oid in carried:
                 reward = delivery_reward(order, t, self.T)
                 late = max(0, t - order.et)
-                slack = order.et - t
-                low_slack_penalty = max(0.0, 4.0 - slack) * (0.05 + 0.03 * order.p)
-                value += reward - self.late_penalty * late - low_slack_penalty
+                value += reward - self.late_penalty * late
                 if oid in picked:
                     value += 1.0
-                    value += self.route_density_weight * self._visible_pickup_density(order, orders)
-                same_dest = sum(
-                    1
-                    for other_id in carried
-                    if other_id != oid and other_id in orders and (orders[other_id].ex, orders[other_id].ey) == target
-                )
-                value += self.same_destination_weight * same_dest
+                    if self.asd >= 16.0:
+                        value += 0.15 * self._visible_pickup_density(order, orders)
+                if self.asd >= 16.0:
+                    same_dest = sum(
+                        1
+                        for other_id in carried
+                        if other_id != oid and other_id in orders and (orders[other_id].ex, orders[other_id].ey) == target
+                    )
+                    value += 0.8 * same_dest
                 load -= order.w
                 carried.remove(oid)
         return value
-
-    def _carried_detour_risk(
-        self,
-        shipper: Shipper,
-        route: Sequence[Stop],
-        candidate: Sequence[Stop],
-        orders: Dict[int, Order],
-        now: int,
-    ) -> float:
-        carried_ids = set(shipper.bag)
-        if not carried_ids:
-            return 0.0
-
-        def finish_times(path: Sequence[Stop]) -> Dict[int, int]:
-            pos = shipper.position
-            t = now
-            result: Dict[int, int] = {}
-            for kind, oid, target in path:
-                d = self.bfs.dist(pos, target)
-                if d >= INF:
-                    return {}
-                t += d
-                pos = target
-                if kind == "deliver" and oid in carried_ids:
-                    result[oid] = t
-            return result
-
-        base_finish = finish_times(route)
-        candidate_finish = finish_times(candidate)
-        if len(candidate_finish) < len(carried_ids):
-            return INF
-        risk = 0.0
-        for oid in carried_ids:
-            order = orders.get(oid)
-            if order is None:
-                continue
-            base_t = base_finish.get(oid, now)
-            cand_t = candidate_finish.get(oid, INF)
-            delay = max(0, cand_t - base_t)
-            slack = order.et - cand_t
-            base_slack = order.et - base_t
-            free_delay = max(0.0, min(4.0 + 0.6 * order.p, 0.35 * max(0, base_slack)))
-            risky_delay = max(0.0, delay - free_delay)
-            deadline_risk = 4.5 * max(0, -slack) + 0.45 * max(0, 2 - slack)
-            risk = max(risk, self.detour_delay_weight * risky_delay + deadline_risk)
-        return risk
 
     def _initial_route(self, shipper: Shipper, orders: Dict[int, Order], now: int) -> List[Stop]:
         carried = self._carried(shipper, orders)
@@ -334,10 +305,7 @@ class VRPOrToolsSolver(Solver):
                 candidate.insert(i, pickup)
                 candidate.insert(j, deliver)
                 score = self._route_score(shipper, candidate, orders, now)
-                risk = self._carried_detour_risk(shipper, route, candidate, orders, now)
-                direct_score = self._completion_score(shipper, order, orders, now)
-                urgency_bonus = max(0.0, min(4.0, direct_score / 35.0))
-                gain = score - base - risk + urgency_bonus
+                gain = score - base
                 if gain > best_gain:
                     best_gain = gain
                     best_route = candidate
@@ -352,29 +320,19 @@ class VRPOrToolsSolver(Solver):
             if self.run_deadline and time.time() > self.run_deadline:
                 break
             best = None
-            feasible: List[Tuple[float, Shipper, Order, List[Stop]]] = []
             for shipper in sorted(shippers, key=lambda s: s.id):
                 if capacity_slots[shipper.id] <= 0:
                     continue
                 for order in self._candidate_pool(shipper, orders, now, limit=30):
                     if order.id in assigned:
                         continue
+                    if shipper.bag and self.asd >= 5.0:
+                        if not is_pickup_safe(shipper, order, orders, now, (order.sx, order.sy), self.bfs.dist):
+                            continue
                     gain, new_route = self._best_insertion(shipper, routes[shipper.id], order, orders, now)
                     if new_route is None or gain <= 0:
                         continue
-                    feasible.append((gain, shipper, order, new_route))
-            if feasible:
-                top_gain = max(item[0] for item in feasible)
-                gains_by_order: Dict[int, List[float]] = {}
-                for gain, _, order, _ in feasible:
-                    gains_by_order.setdefault(order.id, []).append(gain)
-                for gain, shipper, order, new_route in feasible:
-                    order_gains = sorted(gains_by_order[order.id], reverse=True)
-                    second = order_gains[1] if len(order_gains) > 1 else 0.0
-                    regret = max(0.0, gain - second)
-                    near_best = max(0.0, top_gain - gain)
-                    regret_tiebreak = 0.18 * regret if near_best <= max(1.5, 0.08 * abs(top_gain)) else 0.0
-                    key = (gain + regret_tiebreak, gain, order.p, -order.et, -order.id)
+                    key = (gain, order.p, -order.et, -order.id)
                     if best is None or key > best[0]:
                         best = (key, shipper.id, order.id, new_route)
             if best is None:
@@ -391,6 +349,9 @@ class VRPOrToolsSolver(Solver):
         candidates = []
         for shipper in shippers:
             for order in self._candidate_pool(shipper, orders, now, limit=18):
+                if shipper.bag and self.asd >= 5.0:
+                    if not is_pickup_safe(shipper, order, orders, now, (order.sx, order.sy), self.bfs.dist):
+                        continue
                 d1 = self.bfs.dist(shipper.position, (order.sx, order.sy))
                 d2 = self.bfs.dist((order.sx, order.sy), (order.ex, order.ey))
                 if d1 >= INF or d2 >= INF:
@@ -489,8 +450,17 @@ class VRPOrToolsSolver(Solver):
         for shipper in shippers:
             if self._deliverable(shipper, orders, shipper.position):
                 actions[shipper.id] = ("S", 2)
-            elif self._pickup_at(shipper, orders, shipper.position) is not None and not shipper.bag:
-                actions[shipper.id] = ("S", 1)
+            else:
+                here = self._pickup_at(shipper, orders, shipper.position)
+                if self.asd < 5.0:
+                    pickup_allowed = here is not None and not shipper.bag
+                else:
+                    pickup_allowed = here is not None and (
+                        not shipper.bag
+                        or is_pickup_safe(shipper, here, orders, now, shipper.position, self.bfs.dist)
+                    )
+                if pickup_allowed:
+                    actions[shipper.id] = ("S", 1)
 
         active = [s for s in shippers if s.id not in actions]
         routes = self._try_ortools_assignment(active, orders, now)
@@ -498,10 +468,9 @@ class VRPOrToolsSolver(Solver):
             routes = self._build_vrp_routes(active, orders, now)
         self.route_plan = routes
         for shipper in active:
-            route = routes.get(shipper.id, [])
-            actions[shipper.id] = self._first_action(shipper, route, orders)
-            if route:
-                target_positions[shipper.id] = route[0][2]
+            actions[shipper.id] = self._first_action(shipper, routes.get(shipper.id, []), orders)
+            if routes.get(shipper.id):
+                target_positions[shipper.id] = routes[shipper.id][0][2]
         return self._avoid_collisions(obs, actions, target_positions)
 
     def run(self) -> dict:
@@ -511,7 +480,11 @@ class VRPOrToolsSolver(Solver):
         self.run_deadline = start + max(20.0, min(90.0, 0.10 * self.T + 8.0 * self.C))
         while not obs.get("done", False):
             if time.time() > self.run_deadline:
-                actions = {s.id: ("S", 2) for s in obs["shippers"]}
+                if not hasattr(self, "fallback_solver") or self.fallback_solver is None:
+                    from solvers.greedy_bfs import GreedyBFS
+                    self.fallback_solver = GreedyBFS(self.env)
+                    self.fallback_solver._configure_by_observation(self.N, self.C, self.T, self.grid)
+                actions = self.fallback_solver._decide(obs)
             else:
                 actions = self._decide(obs)
             obs, _, done, _ = self.env.step(actions)

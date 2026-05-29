@@ -7,7 +7,13 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from env import DeliveryEnv, Order, Shipper, delivery_reward, valid_next_pos
 from solvers.collision_utils import resolve_collisions_and_blocks
+from solvers.detour_utils import (
+    evaluate_detour_net_reward,
+    is_pickup_safe,
+)
 from solvers.solver import Solver
+from solvers.heuristic_utils import get_cbs_params, estimate_average_shortest_path
+
 
 
 Move = str
